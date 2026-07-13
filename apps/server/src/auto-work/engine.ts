@@ -1133,6 +1133,20 @@ async function createAutoWorkWorktree(repoCwd: string, task: Task, slug: string)
 
 	const baseBranch = await resolveBaseBranch(repoCwd);
 
+	// Refresh origin/<base> before branching from it — merges can land between
+	// scheduler ticks (native auto-merge, humans) without the reconciler's
+	// post-merge fetch, and a stale tracking ref would base this run one merge
+	// behind. Best-effort: offline, the stale ref is still a usable base.
+	const fetch = Bun.spawn(["git", "fetch", "origin", baseBranch], {
+		cwd: repoCwd,
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const fetchExit = await fetch.exited;
+	if (fetchExit !== 0) log.warn(`git fetch origin ${baseBranch} in ${repoCwd} failed (exit ${fetchExit}) — using the existing tracking ref`);
+
 	const proc = Bun.spawn(["git", "worktree", "add", "-b", branch, worktreePath, `origin/${baseBranch}`], {
 		cwd: repoCwd,
 		stdin: "ignore",
