@@ -2428,6 +2428,31 @@ describe("runGlobalAutoWorkCycle", () => {
 		expect(selectorCalls).toBe(0);
 	});
 
+	test("retires an orphaned running run instead of deadlocking the global mutex", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const orphanTask = createTask({ title: "Orphaned by restart", cwd: repoCwd, priority: "P1", autoWork: true });
+		moveTask(orphanTask.id, "s_active", 0);
+		const worktreePath = path.join(repoCwd, ".worktrees", "aw-orphan-global");
+		runGit(["worktree", "add", "-b", "auto-work/orphan-global", worktreePath], repoCwd);
+		startAutoWorkRun({ taskId: orphanTask.id, taskPriority: "P1", sessionId: "sess_gone_global", worktreePath });
+		const startedAt = listAutoWorkRuns({ taskId: orphanTask.id })[0]?.startedAt;
+		if (!startedAt) throw new Error("expected persisted Auto Work run");
+
+		// Past the stale-run grace, with a session neither live nor persisted:
+		// the pre-fix mutex skipped forever with "another auto-work run is
+		// already active"; now the global cycle delegates to the workspace
+		// cycle, which retires the orphan and proceeds.
+		const result = await runGlobalAutoWorkCycle(fakeBridge(new FakeSessionHandle("sess_after_orphan", 10)), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+			createPullRequest: stubCreatePullRequest,
+			now: () => new Date(Date.parse(startedAt) + 60_001),
+		});
+
+		expect(result).not.toEqual({ outcome: "skipped", reason: "another auto-work run is already active" });
+		const orphanRuns = listAutoWorkRuns({ taskId: orphanTask.id });
+		expect(orphanRuns.some((r) => r.status === "failed" && r.failureReason === "session_lost")).toBe(true);
+	});
+
 	test("uses the selector's candidate ID instead of deterministic priority", async () => {
 		const otherRepoCwd = path.join(homeDir, "other-workspace");
 		fs.mkdirSync(otherRepoCwd, { recursive: true });

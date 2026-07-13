@@ -1772,10 +1772,34 @@ export async function runGlobalAutoWorkCycle(
 		return { outcome: "skipped", reason: "backlog/done task states missing — cannot run auto-work" };
 	}
 
-	// Global Auto Work is deliberately sequential. A running row anywhere is
-	// enough to defer this cycle, rather than starting work in another workspace.
-	if (listAutoWorkRuns({ status: "running" }).length > 0) {
-		return { outcome: "skipped", reason: "another auto-work run is already active" };
+	// Global Auto Work is deliberately sequential: a run this process is
+	// actively settling defers the cycle. But a `running` row this process is
+	// NOT settling (orphaned by a server restart) must be resumed or retired
+	// here — the resume path lives in the per-workspace cycle, which this
+	// mutex would otherwise never let us reach again (permanent deadlock).
+	const runningRuns = listAutoWorkRuns({ status: "running" });
+	if (runningRuns.length > 0) {
+		const orphan = runningRuns.find(
+			(r) => !activeRunIds.has(r.id) && now.getTime() - Date.parse(r.startedAt) >= STALE_RUN_GRACE_MS,
+		);
+		if (!orphan) {
+			return { outcome: "skipped", reason: "another auto-work run is already active" };
+		}
+		const orphanCwd = getTask(orphan.taskId)?.cwd;
+		if (!orphanCwd) {
+			// Nothing to resume under — close it out rather than deadlocking.
+			completeAutoWorkRun(orphan.id, { status: "failed", failureReason: "task no longer exists" });
+			broadcastBus.broadcast({ type: "auto_work_runs_changed" });
+			return { outcome: "skipped", reason: `closed orphaned run ${orphan.id} (its task is gone); next cycle proceeds` };
+		}
+		log.info(`global cycle: run ${orphan.id} is orphaned (server restart?) — delegating to ${orphanCwd} for resume-or-retire`);
+		return runAutoWorkCycle(orphanCwd, bridge, {
+			...options,
+			now: () => now,
+			getSubscriptionUsage: () => Promise.resolve(usage),
+			generateBranchSlug:
+				options.generateBranchSlug ?? ((task) => generateBranchSlugWithModel(bridge, orphanCwd, task, options.taskSelectionModel ?? null)),
+		});
 	}
 
 	// Collect distinct enabled cwds from all auto-work–flagged tasks.
