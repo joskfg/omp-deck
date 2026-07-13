@@ -1877,6 +1877,7 @@ function GlobalScheduleCard({ onError }: { onError: (msg: string) => void }) {
 function autoWorkToRequest(config: AutoWorkConfig): SetAutoWorkConfigRequest {
 	return {
 		enabled: config.enabled,
+		autoMerge: config.autoMerge,
 		modelByPriority: config.modelByPriority,
 		timeWindows: config.timeWindows,
 		sessionPctLimit: config.sessionPctLimit,
@@ -2079,6 +2080,22 @@ function AutoWorkConfigModal({
 							onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })}
 						/>
 					</label>
+
+					<div>
+						<label className="flex items-center justify-between text-sm">
+							<span>Auto-merge PRs (no human in the loop)</span>
+							<input
+								type="checkbox"
+								checked={draft.autoMerge}
+								onChange={(e) => setDraft({ ...draft, autoMerge: e.target.checked })}
+							/>
+						</label>
+						<div className="meta mt-1">
+							Arms GitHub auto-merge (squash) on each PR and moves the task to <span className="font-mono">done</span> once
+							CI passes — instead of parking it in <span className="font-mono">validate</span> for review. CI is the only
+							gate; with no branch protection this merges agent work with no human review.
+						</div>
+					</div>
 
 					<div>
 						<div className="mb-1 flex items-center justify-between">

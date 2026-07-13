@@ -39,7 +39,7 @@ import { getAutoWorkGlobalConfig, setAutoWorkGlobalConfig } from "./db/auto-work
 import { completeAutoWorkRun, getAutoWorkCostEstimate, getAutoWorkRun, listAutoWorkRuns } from "./db/auto-work-runs.ts";
 import { getDeckBaseUrl as getServerDeckBaseUrl } from "./db/server-settings.ts";
 import { getTask, updateTask } from "./db/tasks.ts";
-import { appendAgentHistoryEntry, reconcileInactiveAutoWorkRuns, runGlobalAutoWorkCycle, createPullRequestViaGh } from "./auto-work/engine.ts";
+import { appendAgentHistoryEntry, reconcileInactiveAutoWorkRuns, reconcileAutoMergedRuns, runGlobalAutoWorkCycle, createPullRequestViaGh } from "./auto-work/engine.ts";
 import type { RunAutoWorkCycleOptions } from "./auto-work/engine.ts";
 import { buildSessionUrl } from "./deck-links.ts";
 import { broadcastBus } from "./broadcast-bus.ts";
@@ -91,6 +91,7 @@ export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOp
 		try {
 			const saved = setAutoWorkConfig(cwd, {
 				enabled: body.enabled,
+				autoMerge: body.autoMerge,
 				modelByPriority: body.modelByPriority,
 				timeWindows: body.timeWindows,
 				sessionPctLimit: body.sessionPctLimit,
@@ -140,6 +141,7 @@ export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOp
 		}
 
 		await reconcileInactiveAutoWorkRuns(bridge);
+		await reconcileAutoMergedRuns().catch((err) => log.warn("auto-merge reconcile failed", err));
 		const response: ListAutoWorkRunsResponse = { runs: listAutoWorkRuns({ limit, taskId, priority, status }) };
 		return c.json(response);
 	});
@@ -285,6 +287,7 @@ export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOp
 
 function validateWorkspaceShape(body: SetAutoWorkConfigRequest): string | undefined {
 	if (typeof body.enabled !== "boolean") return "enabled must be a boolean";
+	if (typeof body.autoMerge !== "boolean") return "autoMerge must be a boolean";
 
 	if (typeof body.modelByPriority !== "object" || body.modelByPriority === null) {
 		return "modelByPriority must be an object";

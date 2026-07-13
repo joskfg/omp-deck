@@ -350,6 +350,13 @@ export interface RunAutoWorkCycleOptions {
 	 */
 	createPullRequest?: (params: CreatePullRequestParams) => Promise<CreatePullRequestResult>;
 	/**
+	 * Arms GitHub auto-merge on a run's PR when the workspace has `autoMerge`
+	 * on (fully-autonomous mode). Defaults to a real `gh pr merge --auto
+	 * --squash --delete-branch`. Injectable for tests — the real default must
+	 * NEVER run in a test since it would arm a merge on a live GitHub PR.
+	 */
+	armAutoMerge?: (params: ArmAutoMergeParams) => Promise<void>;
+	/**
 	 * Global auto-work model — reused for task selection, squeeze timing, and
 	 * branch-name slug generation (T-77). `null`/unset = bridge/server default.
 	 */
@@ -412,6 +419,7 @@ export async function runAutoWorkCycle(
 	const sessionPctUsed = usage.available && typeof usage.sessionPct === "number" ? usage.sessionPct : null;
 	const resolveDeckBaseUrl = options.getDeckBaseUrl ?? (() => getServerDeckBaseUrl(loadConfig()).deckBaseUrl);
 	const createPullRequest = options.createPullRequest ?? createPullRequestViaGh;
+	const armAutoMerge = options.armAutoMerge ?? armAutoMergeViaGh;
 	const notify = options.notify ?? sendAutoWorkNotification;
 
 	// Weekly-usage budget warning (T-67) — a softer heads-up than
@@ -437,6 +445,7 @@ export async function runAutoWorkCycle(
 		const resumed = await resumeOrRetireAutoWorkRun(cwd, bridge, runningRun, config, {
 			resolveDeckBaseUrl,
 			createPullRequest,
+			armAutoMerge,
 			notify,
 			usageLookup,
 		});
@@ -552,6 +561,8 @@ export async function runAutoWorkCycle(
 		startTurn: () => session.prompt(prompt),
 		resolveDeckBaseUrl,
 		createPullRequest,
+		autoMerge: config.autoMerge,
+		armAutoMerge,
 		notify,
 		usageLookup,
 		startPct: subscriptionPctUsed,
@@ -595,6 +606,9 @@ function finalizeAutoWorkRun(params: {
 	startTurn?: () => Promise<unknown>;
 	resolveDeckBaseUrl: () => string;
 	createPullRequest: (params: CreatePullRequestParams) => Promise<CreatePullRequestResult>;
+	/** Whether this workspace runs fully autonomous (arm auto-merge instead of parking in validate). */
+	autoMerge: boolean;
+	armAutoMerge: (params: ArmAutoMergeParams) => Promise<void>;
 	notify: (event: AutoWorkNotificationEvent) => Promise<void>;
 	/** T-80: used to compute pctConsumed delta after the run closes. */
 	usageLookup: () => Promise<{ available: boolean; weeklyPct?: number }>;
@@ -614,11 +628,13 @@ async function settleAutoWorkRun(params: {
 	startTurn?: () => Promise<unknown>;
 	resolveDeckBaseUrl: () => string;
 	createPullRequest: (params: CreatePullRequestParams) => Promise<CreatePullRequestResult>;
+	autoMerge: boolean;
+	armAutoMerge: (params: ArmAutoMergeParams) => Promise<void>;
 	notify: (event: AutoWorkNotificationEvent) => Promise<void>;
 	usageLookup: () => Promise<{ available: boolean; weeklyPct?: number }>;
 	startPct: number | null;
 }): Promise<AutoWorkCycleResult> {
-	const { runId, task, session, worktreePath, timeoutMinutes, startTurn, resolveDeckBaseUrl, createPullRequest, notify, usageLookup, startPct } =
+	const { runId, task, session, worktreePath, timeoutMinutes, startTurn, resolveDeckBaseUrl, createPullRequest, autoMerge, armAutoMerge, notify, usageLookup, startPct } =
 		params;
 	const terminal = await waitForAutoWorkSessionTerminalResult(session, timeoutMinutes * 60_000, startTurn);
 
@@ -724,6 +740,35 @@ async function settleAutoWorkRun(params: {
 		}
 	}
 
+	// Fully-autonomous mode (autoMerge): park the run as
+	// `completed_pending_merge` and let `reconcileAutoMergedRuns` close the
+	// loop — it merges the PR itself once CI is green and promotes the task to
+	// `done`, so the CI gate holds without requiring GitHub's native
+	// auto-merge (unavailable on private free-plan repos: no required checks).
+	// Arming native auto-merge is a best-effort bonus: when the repo supports
+	// it, GitHub merges faster than our poll.
+	if (autoMerge && prNumber !== undefined) {
+		let autoMergeArmed = false;
+		try {
+			await armAutoMerge({ cwd: worktreePath, prNumber });
+			autoMergeArmed = true;
+		} catch (err) {
+			log.info(`run ${runId}: native auto-merge unavailable for T-${task.displayId} PR #${prNumber} — reconciler will merge when CI passes`, err);
+		}
+		const note = `\n\n---\n**Auto Work — auto-merge${autoMergeArmed ? " armed" : ""}** · [session ${shortSessionId}](${sessionUrl}) · PR #${prNumber}\nWaiting for CI; the task moves to \`done\` once the PR merges.`;
+		updateTask(task.id, {
+			body: appendAgentHistoryEntry(task.body + note, runId, new Date().toISOString(), `Session completed. PR #${prNumber} pending auto-merge.`),
+		});
+		const validateState = findStateByName("validate");
+		if (validateState) moveTask(task.id, validateState.id, 0);
+		completeAutoWorkRun(runId, { status: "completed_pending_merge", inputTokens, outputTokens, pctConsumed, prNumber });
+		broadcastBus.broadcast({ type: "tasks_changed" });
+		broadcastBus.broadcast({ type: "auto_work_runs_changed" });
+		log.info(`run ${runId}: T-${task.displayId} PR #${prNumber} pending auto-merge (native arm: ${autoMergeArmed})`);
+		await notify({ kind: "task_auto_merging", displayId: task.displayId, prNumber });
+		return { outcome: "completed", taskId: task.id, runId, sessionId: session.sessionId, worktreePath };
+	}
+
 	const completeRunNote =
 		prNumber !== undefined
 			? `\n\n---\n**Auto Work** — [session ${shortSessionId}](${sessionUrl}) · PR #${prNumber}`
@@ -746,6 +791,7 @@ async function settleAutoWorkRun(params: {
 		outputTokens,
 		pctConsumed,
 		failureReason: prFailureReason ?? null,
+		prNumber: prNumber ?? null,
 	});
 	broadcastBus.broadcast({ type: "tasks_changed" });
 	broadcastBus.broadcast({ type: "auto_work_runs_changed" });
@@ -898,6 +944,7 @@ async function resumeOrRetireAutoWorkRun(
 	completion: {
 		resolveDeckBaseUrl: () => string;
 		createPullRequest: (params: CreatePullRequestParams) => Promise<CreatePullRequestResult>;
+		armAutoMerge: (params: ArmAutoMergeParams) => Promise<void>;
 		notify: (event: AutoWorkNotificationEvent) => Promise<void>;
 		usageLookup: () => Promise<{ available: boolean; weeklyPct?: number }>;
 	},
@@ -951,6 +998,8 @@ async function resumeOrRetireAutoWorkRun(
 		...(streaming ? {} : { startTurn: () => handle.prompt(continuationPrompt) }),
 		resolveDeckBaseUrl: completion.resolveDeckBaseUrl,
 		createPullRequest: completion.createPullRequest,
+		autoMerge: config.autoMerge,
+		armAutoMerge: completion.armAutoMerge,
 		notify: completion.notify,
 		usageLookup: completion.usageLookup,
 		startPct: null, // resumed run: no meaningful pre-session baseline available
@@ -1221,6 +1270,15 @@ export interface CreatePullRequestResult {
 	number: number;
 }
 
+export interface ArmAutoMergeParams {
+	/** The worktree the PR's head branch is checked out in — `gh` infers the repo/PR from it. */
+	cwd: string;
+	prNumber: number;
+}
+
+/** PR state as the auto-merge reconciler needs it. `"unknown"` = `gh pr view` could not resolve it this pass. */
+export type PullRequestMergeState = "merged" | "closed" | "open" | "unknown";
+
 /**
  * Resolves Auto Work's base branch consistently for worktree creation, commit
  * detection, and PR creation. A valid matching `kb://projects/` policy wins.
@@ -1314,6 +1372,22 @@ function describeGhFailure(stderr: string): string {
  */
 export async function createPullRequestViaGh(params: CreatePullRequestParams): Promise<CreatePullRequestResult> {
 	const baseBranch = await resolveBaseBranch(params.cwd);
+
+	// `gh pr create` runs with stdin ignored, so it cannot interactively push
+	// an unpushed branch and aborts with "you must first push the current
+	// branch". Push first — a no-op when the agent session already pushed.
+	const push = Bun.spawn(["git", "push", "-u", "origin", "HEAD"], {
+		cwd: params.cwd,
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const [pushStderr, pushExit] = await Promise.all([new Response(push.stderr).text(), push.exited]);
+	if (pushExit !== 0) {
+		throw new Error(`git push failed before gh pr create (exited ${pushExit}): ${pushStderr.trim()}`);
+	}
+
 	let proc: Subprocess<"ignore", "pipe", "pipe">;
 	try {
 		proc = Bun.spawn(
@@ -1330,6 +1404,13 @@ export async function createPullRequestViaGh(params: CreatePullRequestParams): P
 		proc.exited,
 	]);
 	if (exitCode !== 0) {
+		// The agent session may have opened the PR itself during its run —
+		// that's a success, not a failure: recover the existing PR instead of
+		// closing the run as `completed_pr_failed`.
+		if (/already exists/i.test(stderr) && /pull request/i.test(stderr)) {
+			const existing = await lookupExistingPullRequest(params.cwd);
+			if (existing) return existing;
+		}
 		throw new Error(`${describeGhFailure(stderr)} (gh pr create exited ${exitCode}): ${stderr.trim()}`);
 	}
 	const url = stdout.trim().split("\n").pop() ?? "";
@@ -1338,6 +1419,271 @@ export async function createPullRequestViaGh(params: CreatePullRequestParams): P
 		throw new Error(`gh pr create succeeded but its output didn't contain a PR URL: ${stdout.trim()}`);
 	}
 	return { url, number: Number(match[1]) };
+}
+
+/** Resolves the already-open PR for the checked-out branch, or `undefined` if `gh pr view` can't find one. */
+async function lookupExistingPullRequest(cwd: string): Promise<CreatePullRequestResult | undefined> {
+	const proc = Bun.spawn(["gh", "pr", "view", "--json", "number,url"], {
+		cwd,
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+	if (exitCode !== 0) return undefined;
+	try {
+		const parsed = JSON.parse(stdout) as { number?: number; url?: string };
+		if (typeof parsed.number === "number" && typeof parsed.url === "string") return { url: parsed.url, number: parsed.number };
+	} catch {
+		// Unparseable gh output — fall through to the original create error.
+	}
+	return undefined;
+}
+
+// ─── Auto-merge (fully-autonomous mode) ──────────────────────────────────────
+
+/**
+ * `gh pr merge <n> --auto --squash`, run from the worktree. `--auto` arms
+ * GitHub's native auto-merge (PR merges itself once required checks pass).
+ * Only works when the repo has auto-merge enabled AND a required check —
+ * both need branch protection, which private free-plan repos lack. Throwing
+ * is fine: the caller parks the run pending anyway and the reconciler merges
+ * once CI is green. NO `--delete-branch`: it tries a local checkout of the
+ * base branch, which is fatal when that branch is checked out in another
+ * worktree (the main clone). Remote branch cleanup is the reconciler's job.
+ */
+async function armAutoMergeViaGh(params: ArmAutoMergeParams): Promise<void> {
+	const proc = Bun.spawn(
+		["gh", "pr", "merge", String(params.prNumber), "--auto", "--squash"],
+		{ cwd: params.cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true },
+	);
+	const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+	if (exitCode !== 0) throw new Error(`gh pr merge --auto exited ${exitCode}: ${stderr.trim()}`);
+}
+
+/** Everything the reconciler needs from one `gh pr view` call. */
+export interface PullRequestInspection {
+	state: PullRequestMergeState;
+	/** CI verdict from statusCheckRollup. Empty rollup = "pending" — the checks may simply not have been reported yet. */
+	checks: "pending" | "passing" | "failing";
+	headRefName?: string;
+}
+
+interface RollupEntry {
+	// CheckRun rows carry status/conclusion; StatusContext rows carry state.
+	status?: string;
+	conclusion?: string;
+	state?: string;
+}
+
+/** `gh pr view <n> --json state,headRefName,statusCheckRollup` → merge state + CI verdict. */
+async function inspectPullRequestViaGh(cwd: string, prNumber: number): Promise<PullRequestInspection> {
+	const proc = Bun.spawn(["gh", "pr", "view", String(prNumber), "--json", "state,headRefName,statusCheckRollup"], {
+		cwd,
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+	if (exitCode !== 0) return { state: "unknown", checks: "pending" };
+	try {
+		const parsed = JSON.parse(stdout) as { state?: string; headRefName?: string; statusCheckRollup?: RollupEntry[] };
+		let state: PullRequestMergeState;
+		switch ((parsed.state ?? "").toUpperCase()) {
+			case "MERGED":
+				state = "merged";
+				break;
+			case "CLOSED":
+				state = "closed";
+				break;
+			case "OPEN":
+				state = "open";
+				break;
+			default:
+				state = "unknown";
+		}
+		const rollup = parsed.statusCheckRollup ?? [];
+		const isDone = (e: RollupEntry) => (e.state !== undefined ? e.state !== "PENDING" && e.state !== "EXPECTED" : e.status === "COMPLETED");
+		const isOk = (e: RollupEntry) => ["SUCCESS", "NEUTRAL", "SKIPPED"].includes(e.conclusion ?? e.state ?? "");
+		// ponytail: empty rollup stays "pending" forever on a repo with no CI —
+		// this mode assumes CI exists ("CI is the reviewer"); merging with zero
+		// checks would remove the gate entirely.
+		let checks: PullRequestInspection["checks"];
+		if (rollup.length === 0) checks = "pending";
+		else if (rollup.some((e) => isDone(e) && !isOk(e))) checks = "failing";
+		else if (rollup.every(isDone)) checks = "passing";
+		else checks = "pending";
+		return { state, checks, headRefName: parsed.headRefName };
+	} catch {
+		return { state: "unknown", checks: "pending" };
+	}
+}
+
+/** `gh pr merge <n> --squash` — immediate merge, used by the reconciler once CI is green. */
+async function mergePullRequestViaGh(cwd: string, prNumber: number): Promise<void> {
+	const proc = Bun.spawn(["gh", "pr", "merge", String(prNumber), "--squash"], {
+		cwd,
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+	if (exitCode !== 0) throw new Error(`gh pr merge --squash exited ${exitCode}: ${stderr.trim()}`);
+}
+
+/** `git push origin --delete <branch>` — remote cleanup after a merge. Throws on failure; callers treat it as best-effort. */
+async function deleteRemoteBranchViaGit(cwd: string, branch: string): Promise<void> {
+	const proc = Bun.spawn(["git", "push", "origin", "--delete", branch], {
+		cwd,
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+	if (exitCode !== 0) throw new Error(`git push origin --delete ${branch} exited ${exitCode}: ${stderr.trim()}`);
+}
+
+/**
+ * Pull a just-merged PR into the main clone's local base branch:
+ * `git fetch origin`, then a best-effort `git pull --ff-only`. The pull is
+ * deliberately allowed to fail silently — if the main worktree has another
+ * branch checked out or a dirty tree, the fetch alone already makes the merge
+ * commit available locally, and clobbering the user's checkout is never worth
+ * it.
+ */
+async function updateLocalBaseRepo(cwd: string): Promise<void> {
+	const fetch = Bun.spawn(["git", "fetch", "origin"], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true });
+	const [fetchStderr, fetchExit] = await Promise.all([new Response(fetch.stderr).text(), fetch.exited]);
+	if (fetchExit !== 0) {
+		log.warn(`git fetch origin in ${cwd} failed (exit ${fetchExit}): ${fetchStderr.trim()}`);
+		return;
+	}
+	const pull = Bun.spawn(["git", "pull", "--ff-only"], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true });
+	const pullExit = await pull.exited;
+	if (pullExit !== 0) log.debug(`git pull --ff-only in ${cwd} skipped (exit ${pullExit}) — fetch already updated remote refs`);
+}
+
+/** Injectable seams for `reconcileAutoMergedRuns` — real `gh`/`git` by default, stubbed in tests. */
+export interface ReconcileAutoMergedRunsOptions {
+	inspectPullRequest?: (cwd: string, prNumber: number) => Promise<PullRequestInspection>;
+	mergePullRequest?: (cwd: string, prNumber: number) => Promise<void>;
+	deleteRemoteBranch?: (cwd: string, branch: string) => Promise<void>;
+	updateLocalRepo?: (cwd: string) => Promise<void>;
+	removeWorktree?: (repoCwd: string, worktreePath: string) => Promise<void>;
+	notify?: (event: AutoWorkNotificationEvent) => Promise<void>;
+}
+
+/**
+ * Second half of fully-autonomous mode: closes the loop on
+ * `completed_pending_merge` runs. Called every scheduler tick and whenever
+ * run history is listed, so it survives server restarts. For each pending run:
+ *  - PR open + CI green → the reconciler merges it itself (`gh pr merge
+ *    --squash`) — this is what makes the mode work on repos where GitHub's
+ *    native auto-merge is unavailable (private free plan: no required checks).
+ *  - PR merged (by us, native auto-merge, or a human) → task to `done`,
+ *    delete the remote branch, fetch the merge into the local base repo,
+ *    remove the worktree, run → `completed`.
+ *  - PR open + CI failed → task to `blocked`, run → `failed`. The worktree is
+ *    kept so a human can fix and push from it.
+ *  - PR closed unmerged → task to `blocked`, remove the worktree, run →
+ *    `failed`.
+ *  - CI still pending (or state unresolved this pass) → left untouched.
+ * Returns how many runs it advanced.
+ */
+export async function reconcileAutoMergedRuns(options: ReconcileAutoMergedRunsOptions = {}): Promise<number> {
+	const inspectPullRequest = options.inspectPullRequest ?? inspectPullRequestViaGh;
+	const mergePullRequest = options.mergePullRequest ?? mergePullRequestViaGh;
+	const deleteRemoteBranch = options.deleteRemoteBranch ?? deleteRemoteBranchViaGit;
+	const updateLocalRepo = options.updateLocalRepo ?? updateLocalBaseRepo;
+	const removeWorktree = options.removeWorktree ?? removeAutoWorkWorktree;
+	const notify = options.notify ?? sendAutoWorkNotification;
+
+	let reconciled = 0;
+	for (const run of listAutoWorkRuns({ status: "completed_pending_merge" })) {
+		if (run.prNumber === null) {
+			// Arming always persists the PR number, so this is defensive: a row
+			// with no PR can never be reconciled, so close it instead of looping.
+			log.warn(`run ${run.id}: completed_pending_merge without a pr_number — marking failed`);
+			completeAutoWorkRun(run.id, { status: "failed", failureReason: "pending merge without a pr_number" });
+			broadcastBus.broadcast({ type: "auto_work_runs_changed" });
+			continue;
+		}
+		const task = getTask(run.taskId);
+		if (!task) {
+			completeAutoWorkRun(run.id, { status: "failed", failureReason: "task no longer exists" });
+			broadcastBus.broadcast({ type: "auto_work_runs_changed" });
+			continue;
+		}
+		const repoCwd = task.cwd;
+		if (!repoCwd) {
+			log.warn(`run ${run.id}: task T-${task.displayId} has no cwd — cannot reconcile its merge, leaving pending`);
+			continue;
+		}
+		let pr: PullRequestInspection;
+		try {
+			pr = await inspectPullRequest(repoCwd, run.prNumber);
+		} catch (err) {
+			log.warn(`run ${run.id}: PR #${run.prNumber} state lookup failed, leaving pending`, err);
+			continue;
+		}
+		if (pr.state === "unknown") continue;
+		if (pr.state === "open" && pr.checks === "pending") continue;
+
+		if (pr.state === "open" && pr.checks === "passing") {
+			try {
+				await mergePullRequest(repoCwd, run.prNumber);
+				pr.state = "merged";
+			} catch (err) {
+				// A merge conflict with the base, a race with native auto-merge,
+				// a gh hiccup — retry next pass rather than failing the run.
+				log.warn(`run ${run.id}: CI green but merge of PR #${run.prNumber} failed, retrying next pass`, err);
+				continue;
+			}
+		}
+
+		if (pr.state === "merged") {
+			const doneState = findStateByName("done");
+			if (doneState) moveTask(task.id, doneState.id, 0);
+			if (pr.headRefName) {
+				await deleteRemoteBranch(repoCwd, pr.headRefName).catch((err) =>
+					log.debug(`run ${run.id}: remote branch ${pr.headRefName} cleanup skipped`, err),
+				);
+			}
+			await updateLocalRepo(repoCwd).catch((err) => log.warn(`run ${run.id}: local repo update failed`, err));
+			await removeWorktree(repoCwd, run.worktreePath).catch((err) => log.warn(`run ${run.id}: worktree removal failed`, err));
+			completeAutoWorkRun(run.id, { status: "completed" });
+			updateTask(task.id, {
+				body: appendAgentHistoryEntry(task.body, run.id, new Date().toISOString(), `PR #${run.prNumber} merged — task done.`),
+			});
+			broadcastBus.broadcast({ type: "tasks_changed" });
+			broadcastBus.broadcast({ type: "auto_work_runs_changed" });
+			log.info(`run ${run.id}: PR #${run.prNumber} merged — T-${task.displayId} moved to done`);
+			await notify({ kind: "task_auto_merged", displayId: task.displayId, prNumber: run.prNumber });
+			reconciled += 1;
+		} else {
+			// PR closed without merging, or open with CI failed. Keep the
+			// worktree in the CI-failed case — a human can fix and push from it.
+			const closed = pr.state === "closed";
+			const reason = closed ? `PR #${run.prNumber} closed without merging` : `CI failed on PR #${run.prNumber}`;
+			const blockedState = findStateByName("blocked");
+			if (blockedState) moveTask(task.id, blockedState.id, 0);
+			if (closed) await removeWorktree(repoCwd, run.worktreePath).catch((err) => log.warn(`run ${run.id}: worktree removal failed`, err));
+			completeAutoWorkRun(run.id, { status: "failed", failureReason: reason });
+			updateTask(task.id, {
+				body: appendAgentHistoryEntry(task.body, run.id, new Date().toISOString(), `${reason} — task blocked.`),
+			});
+			broadcastBus.broadcast({ type: "tasks_changed" });
+			broadcastBus.broadcast({ type: "auto_work_runs_changed" });
+			log.warn(`run ${run.id}: ${reason} — T-${task.displayId} moved to blocked`);
+			await notify({ kind: "task_failed", displayId: task.displayId, reason });
+			reconciled += 1;
+		}
+	}
+	return reconciled;
 }
 
 
@@ -1434,6 +1780,9 @@ export async function runGlobalAutoWorkCycle(
 	const tasksById = new Map(allTasks.map((t) => [t.id, t]));
 
 	const candidates: GlobalAutoWorkCandidate[] = [];
+	// Per-workspace skip causes, surfaced in the skip reason so a manual
+	// trigger explains WHY nothing ran (budget vs window vs no tasks).
+	const skipDetails: string[] = [];
 
 	for (const cwd of enabledCwds) {
 		const config = getAutoWorkConfig(cwd);
@@ -1444,6 +1793,7 @@ export async function runGlobalAutoWorkCycle(
 		const preflight = checkAutoWorkPreflight({ config, now, subscriptionPctUsed, sessionPctUsed, activeRuns });
 		if (!preflight.ok) {
 			log.debug(`global cycle: ${cwd} skipped (${preflight.reason})`);
+			skipDetails.push(`${cwd}: ${preflight.reason}`);
 			continue;
 		}
 		const cwdTasks = allTasks.filter((t) => t.cwd === cwd);
@@ -1457,11 +1807,20 @@ export async function runGlobalAutoWorkCycle(
 		});
 		if (selection.kind === "selected") {
 			candidates.push({ workspaceCwd: cwd, task: selection.task, estimatedCostPct: selection.estimatedCostPct });
+		} else if (selection.kind === "none_fit") {
+			skipDetails.push(
+				`${cwd}: ${selection.consideredCount} eligible task(s), but none fit the weekly budget (${subscriptionPctUsed ?? 0}% used, limit ${config.weeklyPctLimit}%)`,
+			);
+		} else {
+			skipDetails.push(`${cwd}: no eligible backlog task`);
 		}
 	}
 
 	if (candidates.length === 0) {
-		return { outcome: "skipped", reason: "no eligible task fits the current budget across all workspaces" };
+		return {
+			outcome: "skipped",
+			reason: skipDetails.length > 0 ? skipDetails.join("; ") : "no eligible task fits the current budget across all workspaces",
+		};
 	}
 
 	// Priority remains the deterministic fallback. A selector only runs after

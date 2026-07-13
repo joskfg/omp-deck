@@ -2053,6 +2053,17 @@ export interface AutoWorkTimeWindow {
 export interface AutoWorkConfig {
 	workspaceCwd: string;
 	enabled: boolean;
+	/**
+	 * Fully-autonomous mode: on a successful run, arm GitHub auto-merge on the
+	 * PR (`gh pr merge --auto --squash`) instead of parking the task in
+	 * `validate` for human review. The merge itself still waits for required
+	 * CI checks to go green — CI becomes the reviewer. Once GitHub reports the
+	 * PR merged, a reconciliation pass moves the task to `done`, fetches the
+	 * merge into the local base repo, and removes the worktree. Default false;
+	 * with no branch protection this merges agent work to the base branch with
+	 * no human in the loop, so it is opt-in per workspace.
+	 */
+	autoMerge: boolean;
 	modelByPriority: AutoWorkModelByPriority;
 	/**
 	 * Non-overlapping time windows (hour-of-day) during which auto-work may
@@ -2092,6 +2103,7 @@ export interface AutoWorkConfig {
 /** `PUT /api/auto-work/config?cwd=` body — replaces the full config. */
 export interface SetAutoWorkConfigRequest {
 	enabled: boolean;
+	autoMerge: boolean;
 	modelByPriority: AutoWorkModelByPriority;
 	timeWindows: AutoWorkTimeWindow[];
 	sessionPctLimit: number;
@@ -2256,7 +2268,13 @@ export interface SetPlanModelRequest {
 // Auto Work run history and cost tracking (T-62)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type AutoWorkRunStatus = "running" | "completed" | "completed_pr_failed" | "failed" | "timed_out";
+export type AutoWorkRunStatus =
+	| "running"
+	| "completed"
+	| "completed_pr_failed"
+	| "completed_pending_merge"
+	| "failed"
+	| "timed_out";
 
 /**
  * One historical (or in-flight) Auto Work run. A row is inserted with
@@ -2273,6 +2291,11 @@ export type AutoWorkRunStatus = "running" | "completed" | "completed_pr_failed" 
  * inferring PR failure from task-body text (T-85). `failureReason` on
  * such a row holds the actionable `gh` error; retry via
  * `POST /auto-work/runs/:id/create-pr`.
+ *
+ * `"completed_pending_merge"` means auto-merge mode armed GitHub auto-merge
+ * on the PR and the run is waiting for CI to go green so GitHub merges it;
+ * `prNumber` holds the PR the reconciler polls. It flips to `"completed"`
+ * once merged (task → `done`) or `"failed"` if the PR is closed unmerged.
  */
 export interface AutoWorkRun {
 	id: string;
@@ -2284,6 +2307,8 @@ export interface AutoWorkRun {
 	startedAt: string;
 	completedAt: string | null;
 	status: AutoWorkRunStatus;
+	/** PR opened by this run, when known. Set on PR creation; drives the auto-merge reconciler. */
+	prNumber: number | null;
 	inputTokens: number | null;
 	outputTokens: number | null;
 	/** Subscription % consumed during this run, computed from a usage delta. */

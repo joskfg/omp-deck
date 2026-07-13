@@ -62,6 +62,7 @@ function fakeBridge(models: ModelInfo[]): AgentBridge {
 function fullConfigBody(overrides: Partial<SetAutoWorkConfigRequest> = {}): SetAutoWorkConfigRequest {
 	return {
 		enabled: true,
+		autoMerge: false,
 		modelByPriority: { P0: null, P1: null, P2: null, P3: null, P4: null, P5: null },
 		timeWindows: [{ start: 9, end: 17 }],
 		sessionPctLimit: 25,

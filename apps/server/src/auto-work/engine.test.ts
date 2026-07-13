@@ -20,7 +20,7 @@ import type { AutoWorkConfig, ModelInfo, SessionSummary, Task, TaskPriority } fr
 import type { AgentBridge, CreateSessionOpts, EventListener, SessionHandle } from "../bridge/types.ts";
 import { broadcastBus } from "../broadcast-bus.ts";
 import { DEFAULT_AUTO_WORK_VALUES, setAutoWorkConfig } from "../db/auto-work.ts";
-import { getAutoWorkCostEstimate, listAutoWorkRuns, startAutoWorkRun } from "../db/auto-work-runs.ts";
+import { completeAutoWorkRun, getAutoWorkCostEstimate, listAutoWorkRuns, startAutoWorkRun } from "../db/auto-work-runs.ts";
 import { closeDb, openDb } from "../db/index.ts";
 import { setInternalTaskModel } from "../db/server-settings.ts";
 import { createTask, getTask, moveTask } from "../db/tasks.ts";
@@ -35,6 +35,7 @@ import {
 	decideSqueezeTiming,
 	extractAgentHistory,
 	generateBranchSlugWithModel,
+	reconcileAutoMergedRuns,
 	reconcileInactiveAutoWorkRuns,
 	resolveAutoWorkModel,
 	resolveAutoWorkTimeoutMinutes,
@@ -171,6 +172,7 @@ describe("checkAutoWorkPreflight", () => {
 					outputTokens: null,
 					pctConsumed: null,
 					failureReason: null,
+					prNumber: null,
 				},
 			],
 		});
@@ -198,6 +200,7 @@ describe("checkAutoWorkPreflight", () => {
 					outputTokens: 1,
 					pctConsumed: 5,
 					failureReason: null,
+					prNumber: null,
 				},
 			],
 		});
@@ -457,6 +460,7 @@ describe("classifyRunningAutoWorkRun", () => {
 		outputTokens: null,
 		pctConsumed: null,
 		failureReason: null,
+		prNumber: null,
 	};
 
 	test("resumes when the session and its worktree both still exist", () => {
@@ -1531,6 +1535,57 @@ describe("createPullRequestViaGh", () => {
 			restore();
 		}
 	});
+
+	test("pushes the unpushed task branch to origin before gh pr create", async () => {
+		runGit(["checkout", "-q", "-b", "auto-work/t1-demo"], repoCwd);
+		fs.writeFileSync(path.join(repoCwd, "work.txt"), "done\n");
+		runGit(["add", "."], repoCwd);
+		runGit(["commit", "-q", "-m", "work"], repoCwd);
+
+		const restore = withFakeGhSpawn(() => ({
+			stdout: new Blob(["https://github.com/o/r/pull/12\n"]).stream(),
+			stderr: new Blob([""]).stream(),
+			exited: Promise.resolve(0),
+		}));
+		try {
+			const result = await createPullRequestViaGh({ cwd: repoCwd, title: "T", body: "B" });
+			expect(result.number).toBe(12);
+		} finally {
+			restore();
+		}
+
+		const lsRemote = Bun.spawnSync({
+			cmd: ["git", "ls-remote", "--heads", "origin", "auto-work/t1-demo"],
+			cwd: repoCwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(lsRemote.stdout.toString()).toContain("auto-work/t1-demo");
+	});
+
+	test("recovers the agent-created PR when gh pr create reports it already exists", async () => {
+		const restore = withFakeGhSpawn((cmd) => {
+			if (cmd[1] === "pr" && cmd[2] === "create") {
+				return fakeGhFailure(
+					'a pull request for branch "auto-work/t3-x" into branch "main" already exists:\nhttps://github.com/o/r/pull/3',
+				);
+			}
+			if (cmd[1] === "pr" && cmd[2] === "view") {
+				return {
+					stdout: new Blob(['{"number":3,"url":"https://github.com/o/r/pull/3"}']).stream(),
+					stderr: new Blob([""]).stream(),
+					exited: Promise.resolve(0),
+				};
+			}
+			return fakeGhFailure(`unexpected gh command: ${cmd.join(" ")}`);
+		});
+		try {
+			const result = await createPullRequestViaGh({ cwd: repoCwd, title: "T", body: "B" });
+			expect(result).toEqual({ url: "https://github.com/o/r/pull/3", number: 3 });
+		} finally {
+			restore();
+		}
+	});
 });
 
 describe("runAutoWorkCycle", () => {
@@ -1565,6 +1620,55 @@ describe("runAutoWorkCycle", () => {
 		expect(runs[0]?.status).toBe("completed");
 		expect(runs[0]?.sessionId).toBe("sess_1");
 		expect(runs[0]?.worktreePath).toBe(result.worktreePath);
+	});
+
+	test("autoMerge arms GitHub auto-merge and parks the run as completed_pending_merge", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true, autoMerge: true });
+		const task = createTask({ title: "Autonomous ship", cwd: repoCwd, priority: "P5", autoWork: true });
+
+		const armed: { cwd: string; prNumber: number }[] = [];
+		const result = await runAutoWorkCycle(repoCwd, fakeBridge(new FakeSessionHandle("sess_am", 10)), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+			createPullRequest: stubCreatePullRequest,
+			armAutoMerge: async (p) => {
+				armed.push(p);
+			},
+		});
+
+		expect(result.outcome).toBe("completed");
+		expect(armed).toHaveLength(1);
+		expect(armed[0]?.prNumber).toBe(321);
+
+		// Stays in validate as a holding pen; the reconciler promotes it to done once merged.
+		expect(getTask(task.id)?.stateId).toBe("s_validate");
+		expect(getTask(task.id)?.body).toContain("auto-merge armed");
+
+		const runs = listAutoWorkRuns({ taskId: task.id });
+		expect(runs[0]?.status).toBe("completed_pending_merge");
+		expect(runs[0]?.prNumber).toBe(321);
+	});
+
+	test("autoMerge still parks the run as completed_pending_merge when native arming fails", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true, autoMerge: true });
+		const task = createTask({ title: "Arming fails", cwd: repoCwd, priority: "P5", autoWork: true });
+
+		const result = await runAutoWorkCycle(repoCwd, fakeBridge(new FakeSessionHandle("sess_amfail", 10)), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+			createPullRequest: stubCreatePullRequest,
+			armAutoMerge: async () => {
+				throw new Error("auto-merge is not allowed for this repository");
+			},
+		});
+
+		// Native arming is a best-effort bonus — the reconciler merges the PR
+		// itself once CI is green, so the run stays pending either way.
+		expect(result.outcome).toBe("completed");
+		expect(getTask(task.id)?.stateId).toBe("s_validate");
+		expect(getTask(task.id)?.body).toContain("Waiting for CI");
+
+		const runs = listAutoWorkRuns({ taskId: task.id });
+		expect(runs[0]?.status).toBe("completed_pending_merge");
+		expect(runs[0]?.prNumber).toBe(321);
 	});
 
 	test("creates an Auto Work worktree from the matching KB branch rather than origin/HEAD", async () => {
@@ -2824,5 +2928,161 @@ describe("runAutoWorkCycle token and pct recording (T-80)", () => {
 		expect(run?.outputTokens).toBeNull();
 		// pctConsumed is 0 because both start and end weeklyPct = 5 (same stub each call)
 		expect(run?.pctConsumed).toBe(0);
+	});
+});
+
+describe("reconcileAutoMergedRuns (fully-autonomous mode)", () => {
+	function seedPendingMergeRun(prNumber: number, worktreePath: string) {
+		const task = createTask({ title: `pending #${prNumber}`, cwd: repoCwd, priority: "P5", autoWork: true });
+		moveTask(task.id, "s_validate", 0);
+		const runId = startAutoWorkRun({ taskId: task.id, taskPriority: "P5", sessionId: `sess_${prNumber}`, worktreePath });
+		completeAutoWorkRun(runId, { status: "completed_pending_merge", prNumber });
+		return { task, runId };
+	}
+
+	test("promotes a merged pending run to done, deletes the remote branch, updates the local repo, and removes the worktree", async () => {
+		const { task } = seedPendingMergeRun(321, "/tmp/wt-merged");
+		const updatedLocal: string[] = [];
+		const removed: string[] = [];
+		const deletedBranches: string[] = [];
+		const { notify, calls } = recordingNotify();
+
+		const n = await reconcileAutoMergedRuns({
+			inspectPullRequest: async () => ({ state: "merged", checks: "passing", headRefName: "auto-work/t1-merged" }),
+			mergePullRequest: async () => {
+				throw new Error("must not merge an already-merged PR");
+			},
+			deleteRemoteBranch: async (_cwd, branch) => {
+				deletedBranches.push(branch);
+			},
+			updateLocalRepo: async (cwd) => {
+				updatedLocal.push(cwd);
+			},
+			removeWorktree: async (_repo, wt) => {
+				removed.push(wt);
+			},
+			notify,
+		});
+
+		expect(n).toBe(1);
+		expect(getTask(task.id)?.stateId).toBe("s_done");
+		expect(updatedLocal).toEqual([repoCwd]);
+		expect(removed).toEqual(["/tmp/wt-merged"]);
+		expect(deletedBranches).toEqual(["auto-work/t1-merged"]);
+		expect(listAutoWorkRuns({ taskId: task.id })[0]?.status).toBe("completed");
+		expect(calls).toContainEqual({ kind: "task_auto_merged", displayId: task.displayId, prNumber: 321 });
+	});
+
+	test("merges an open pending run itself once CI is green", async () => {
+		const { task } = seedPendingMergeRun(55, "/tmp/wt-green");
+		const mergedPrs: number[] = [];
+		const { notify, calls } = recordingNotify();
+
+		const n = await reconcileAutoMergedRuns({
+			inspectPullRequest: async () => ({ state: "open", checks: "passing", headRefName: "auto-work/t2-green" }),
+			mergePullRequest: async (_cwd, prNumber) => {
+				mergedPrs.push(prNumber);
+			},
+			deleteRemoteBranch: async () => {},
+			updateLocalRepo: async () => {},
+			removeWorktree: async () => {},
+			notify,
+		});
+
+		expect(n).toBe(1);
+		expect(mergedPrs).toEqual([55]);
+		expect(getTask(task.id)?.stateId).toBe("s_done");
+		expect(listAutoWorkRuns({ taskId: task.id })[0]?.status).toBe("completed");
+		expect(calls).toContainEqual({ kind: "task_auto_merged", displayId: task.displayId, prNumber: 55 });
+	});
+
+	test("leaves the run pending when CI is green but the merge itself fails", async () => {
+		const { task } = seedPendingMergeRun(56, "/tmp/wt-merge-fail");
+		const { notify, calls } = recordingNotify();
+
+		const n = await reconcileAutoMergedRuns({
+			inspectPullRequest: async () => ({ state: "open", checks: "passing" }),
+			mergePullRequest: async () => {
+				throw new Error("merge conflict with base");
+			},
+			deleteRemoteBranch: async () => {},
+			updateLocalRepo: async () => {},
+			removeWorktree: async () => {},
+			notify,
+		});
+
+		expect(n).toBe(0);
+		expect(getTask(task.id)?.stateId).toBe("s_validate");
+		expect(listAutoWorkRuns({ taskId: task.id })[0]?.status).toBe("completed_pending_merge");
+		expect(calls).toHaveLength(0);
+	});
+
+	test("moves the task to blocked when CI fails, keeping the worktree for a human fix", async () => {
+		const { task } = seedPendingMergeRun(57, "/tmp/wt-red");
+		const removed: string[] = [];
+		const { notify, calls } = recordingNotify();
+
+		const n = await reconcileAutoMergedRuns({
+			inspectPullRequest: async () => ({ state: "open", checks: "failing" }),
+			mergePullRequest: async () => {
+				throw new Error("must not merge a red PR");
+			},
+			deleteRemoteBranch: async () => {},
+			updateLocalRepo: async () => {},
+			removeWorktree: async (_repo, wt) => {
+				removed.push(wt);
+			},
+			notify,
+		});
+
+		expect(n).toBe(1);
+		expect(getTask(task.id)?.stateId).toBe("s_blocked");
+		expect(removed).toEqual([]);
+		const run = listAutoWorkRuns({ taskId: task.id })[0];
+		expect(run?.status).toBe("failed");
+		expect(run?.failureReason).toContain("CI failed");
+		expect(calls[0]?.kind).toBe("task_failed");
+	});
+
+	test("moves a closed-unmerged pending run's task to blocked and fails the run", async () => {
+		const { task } = seedPendingMergeRun(99, "/tmp/wt-closed");
+		const removed: string[] = [];
+		const { notify, calls } = recordingNotify();
+
+		const n = await reconcileAutoMergedRuns({
+			inspectPullRequest: async () => ({ state: "closed", checks: "pending" }),
+			mergePullRequest: async () => {},
+			deleteRemoteBranch: async () => {},
+			updateLocalRepo: async () => {},
+			removeWorktree: async (_repo, wt) => {
+				removed.push(wt);
+			},
+			notify,
+		});
+
+		expect(n).toBe(1);
+		expect(getTask(task.id)?.stateId).toBe("s_blocked");
+		expect(removed).toEqual(["/tmp/wt-closed"]);
+		expect(listAutoWorkRuns({ taskId: task.id })[0]?.status).toBe("failed");
+		expect(calls[0]?.kind).toBe("task_failed");
+	});
+
+	test("leaves a still-open pending run untouched while CI is pending", async () => {
+		const { task } = seedPendingMergeRun(7, "/tmp/wt-open");
+		const { notify, calls } = recordingNotify();
+
+		const n = await reconcileAutoMergedRuns({
+			inspectPullRequest: async () => ({ state: "open", checks: "pending" }),
+			mergePullRequest: async () => {},
+			deleteRemoteBranch: async () => {},
+			updateLocalRepo: async () => {},
+			removeWorktree: async () => {},
+			notify,
+		});
+
+		expect(n).toBe(0);
+		expect(getTask(task.id)?.stateId).toBe("s_validate");
+		expect(listAutoWorkRuns({ taskId: task.id })[0]?.status).toBe("completed_pending_merge");
+		expect(calls).toHaveLength(0);
 	});
 });

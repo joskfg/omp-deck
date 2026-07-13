@@ -42,6 +42,7 @@ describe("auto-work config", () => {
 		bootDb();
 		const stored = setAutoWorkConfig("/tmp/project-a", {
 			enabled: true,
+			autoMerge: true,
 			modelByPriority: {
 				P0: { provider: "anthropic", id: "claude-x" },
 				P1: null,
