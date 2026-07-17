@@ -25,7 +25,7 @@ let registryPromise: Promise<ModelRegistry> | undefined;
 
 export function getDeckModelRegistry(): Promise<ModelRegistry> {
 	if (registryPromise) return registryPromise;
-	registryPromise = (async () => {
+	const initialization = (async () => {
 		const auth = await discoverAuthStorage();
 		const registry = new ModelRegistry(auth);
 		// Offline refresh = read models.yml + built-ins; online runs in background.
@@ -35,7 +35,13 @@ export function getDeckModelRegistry(): Promise<ModelRegistry> {
 		log.info("model registry ready");
 		return registry;
 	})();
-	return registryPromise;
+	registryPromise = initialization;
+	void initialization.catch(() => {
+		// Initialization failures are transient, for example a malformed or
+		// temporarily unavailable auth store. Do not permanently cache them.
+		if (registryPromise === initialization) registryPromise = undefined;
+	});
+	return initialization;
 }
 
 export async function getDeckAuthStorage(): Promise<AuthStorage> {

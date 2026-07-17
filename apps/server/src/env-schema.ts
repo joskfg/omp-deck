@@ -41,6 +41,15 @@ export const ENV_SCHEMA: EnvSchemaEntry[] = [
 		description: "Vite dev server port.",
 	},
 	{
+		key: "OMP_DECK_TITLE",
+		defaultValue: "omp-deck",
+		valueType: "string",
+		sensitive: false,
+		restartRequired: true,
+		hotApply: false,
+		description: "Visible title in the upper-left corner of the web interface.",
+	},
+	{
 		key: "OMP_DECK_DEFAULT_CWD",
 		valueType: "path",
 		sensitive: false,
@@ -54,7 +63,7 @@ export const ENV_SCHEMA: EnvSchemaEntry[] = [
 		sensitive: false,
 		restartRequired: false,
 		hotApply: true,
-		description: "Comma-separated extra workspace roots.",
+		description: "Comma-separated additional allowed workspace roots for sessions, filesystem browsing, delegation artifacts, and workspace MCP routes.",
 	},
 	{
 		key: "OMP_DECK_IDLE_TIMEOUT_MS",
@@ -220,13 +229,21 @@ export const ENV_SCHEMA: EnvSchemaEntry[] = [
 		description: "Floor: wall-clock ms between consecutive fires (cross-session via disk state).",
 	},
 	{
+		key: "OMP_DECK_KB_ROOT",
+		valueType: "path",
+		sensitive: false,
+		restartRequired: true,
+		hotApply: false,
+		description: "Root directory of the user's KB wiki. Defaults to ~/kb when unset.",
+	},
+	{
 		key: "OMP_DECK_ORG_ROOT",
 		valueType: "path",
 		sensitive: false,
 		restartRequired: false,
 		hotApply: true,
 		description:
-			"Deck-session org root the maintenance-gate uses to anchor captures. Set automatically by the server to ~/kb unless overridden or disabled.",
+			"Deck org root used by the maintenance-gate extension. Set automatically by the server to the resolved KB root (OMP_DECK_KB_ROOT, default ~/kb) unless explicitly set or the gate is disabled.",
 	},
 ];
 

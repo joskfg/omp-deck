@@ -82,6 +82,25 @@ export function buildKbRouter(service: KbService): Hono {
 		}
 	});
 
+	app.post("/kb/folder", async (c) => {
+		const subpath = c.req.query("path");
+		if (!subpath) return c.json({ error: "path required" }, 400);
+		try {
+			const result = await service.createFolder(subpath);
+			switch (result.kind) {
+				case "ok":
+					return c.json(result.entry);
+				case "conflict":
+					return c.json({ error: "already exists" }, 409);
+				case "invalid-path":
+					return c.json({ error: "invalid path (escapes kb root or excluded)" }, 400);
+			}
+		} catch (err) {
+			log.error(`POST /kb/folder failed`, err);
+			return c.json({ error: String(err) }, 500);
+		}
+	});
+
 	app.get("/kb/graph", async (c) => {
 		try {
 			const body = await service.getGraph();

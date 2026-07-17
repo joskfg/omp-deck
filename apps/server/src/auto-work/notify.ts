@@ -77,9 +77,9 @@ function calendarDate(now: Date): string {
  *
  * The `weekly_threshold` event is deduped to at most once per calendar day
  * (UTC) per `cwd`, persisted via the T-61 `server_settings` KV store so the
- * dedup survives a server restart. The dedup marker is only written once an
- * attempt was actually made (i.e. the bridge was configured) — an
- * unconfigured bridge never "uses up" the day's notification.
+ * dedup survives a server restart. The dedup marker is only written once at
+ * least one recipient receives the message, so an unconfigured or entirely
+ * failed delivery never "uses up" the day's notification.
  */
 export async function notify(event: AutoWorkNotificationEvent, now: Date = new Date()): Promise<void> {
 	try {
@@ -97,17 +97,19 @@ export async function notify(event: AutoWorkNotificationEvent, now: Date = new D
 		const telegramConfig = loadTelegramBridgeConfig();
 		const text = formatAutoWorkNotification(event);
 		const api = new TelegramApi(telegramConfig.botToken);
+		let delivered = false;
 		await Promise.all(
 			Array.from(telegramConfig.allowedUserIds).map(async (chatId) => {
 				try {
 					await api.sendMessage(chatId, text);
+					delivered = true;
 				} catch (err) {
 					log.warn(`telegram sendMessage failed for chat ${chatId}`, err);
 				}
 			}),
 		);
 
-		if (dedupKey) setServerSetting(dedupKey, calendarDate(now));
+		if (dedupKey && delivered) setServerSetting(dedupKey, calendarDate(now));
 	} catch (err) {
 		// Belt-and-braces: `loadTelegramBridgeConfig` can still throw (e.g. a
 		// malformed TELEGRAM_ALLOWED_USERS slipped past `isTelegramBridgeConfigured`'s

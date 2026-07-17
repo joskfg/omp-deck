@@ -18,9 +18,15 @@ interface ActiveRun {
 	abort: AbortController;
 }
 
+interface QueuedRun {
+	runId: string;
+	abort: AbortController;
+	release: () => void;
+}
+
 interface RoutineEntry {
 	active: ActiveRun[];
-	queued: Array<() => void>;
+	queued: QueuedRun[];
 }
 
 const MAX_QUEUE_DEPTH = 10;
@@ -61,13 +67,22 @@ export class ConcurrencyController {
 					return { kind: "skip", reason: "concurrency_skipped" };
 				}
 				const abort = new AbortController();
-				const release = new Promise<void>((resolve) => {
-					entry.queued.push(() => {
-						entry.active.push({ runId, abort });
-						resolve();
-					});
+				let release!: () => void;
+				const releasePromise = new Promise<void>((resolve) => {
+					release = resolve;
 				});
-				return { kind: "queue", abort, release };
+				const queued: QueuedRun = { runId, abort, release };
+				entry.queued.push(queued);
+				abort.signal.addEventListener(
+					"abort",
+					() => {
+						const index = entry.queued.indexOf(queued);
+						if (index >= 0) entry.queued.splice(index, 1);
+						release();
+					},
+					{ once: true },
+				);
+				return { kind: "queue", abort, release: releasePromise };
 			}
 			default:
 				return { kind: "skip", reason: "concurrency_skipped" };
@@ -78,10 +93,22 @@ export class ConcurrencyController {
 	finish(routineId: string, runId: string): void {
 		const entry = this.routines.get(routineId);
 		if (!entry) return;
+		const activeCount = entry.active.length;
 		entry.active = entry.active.filter((r) => r.runId !== runId);
-		// Promote the head of the queue if any.
-		const next = entry.queued.shift();
-		if (next) next();
+		if (entry.active.length === activeCount) return;
+		// Only the final active run releases a queued slot.
+		if (entry.active.length === 0) {
+			while (entry.queued.length > 0) {
+				const next = entry.queued.shift()!;
+				if (next.abort.signal.aborted) {
+					next.release();
+					continue;
+				}
+				entry.active.push({ runId: next.runId, abort: next.abort });
+				next.release();
+				break;
+			}
+		}
 		if (entry.active.length === 0 && entry.queued.length === 0) {
 			this.routines.delete(routineId);
 		}

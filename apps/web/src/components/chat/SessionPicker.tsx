@@ -55,7 +55,7 @@ export function SessionPicker() {
 	async function resume(s: SessionSummary): Promise<void> {
 		setBusy(true);
 		try {
-			await createSession({ cwd: defaultCwd, resumeFromPath: s.path });
+			await createSession({ cwd: s.cwd ?? defaultCwd, resumeFromPath: s.path });
 		} catch (err) {
 			console.error(err);
 			alert(`Failed to resume: ${String(err)}`);

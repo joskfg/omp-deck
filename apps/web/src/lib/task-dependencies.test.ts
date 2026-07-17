@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Task } from "@omp-deck/protocol";
 
-import { candidateDependencyTasks, resolveDependencyTasks, resolveDependentTasks } from "./task-dependencies";
+import { DEPENDENCY_ELIGIBLE_STATE_IDS, candidateDependencyTasks, resolveDependencyTasks, resolveDependentTasks } from "./task-dependencies";
 
 function task(overrides: Partial<Task> & { id: string }): Task {
 	return {
@@ -95,5 +95,55 @@ describe("resolveDependentTasks", () => {
 		// Self-dependency is rejected at DB level; guard against stale data.
 		const a = task({ id: "a", dependsOn: ["a"] });
 		expect(resolveDependentTasks(a, [a])).toEqual([]);
+	});
+});
+
+describe("candidateDependencyTasks — state + project filters (T-126)", () => {
+	test("excludes tasks in a non-eligible state (done)", () => {
+		const done = task({ id: "done1", stateId: "s_done" });
+		const active = task({ id: "active1", stateId: "s_active" });
+		const t = task({ id: "t" });
+		const candidates = candidateDependencyTasks(t, [done, active, t]);
+		expect(candidates.map((c) => c.id)).toEqual(["active1"]);
+	});
+
+	test("includes tasks in all four eligible states", () => {
+		const bl = task({ id: "bl", displayId: 1, stateId: "s_backlog" });
+		const ac = task({ id: "ac", displayId: 2, stateId: "s_active" });
+		const bk = task({ id: "bk", displayId: 3, stateId: "s_blocked" });
+		const vl = task({ id: "vl", displayId: 4, stateId: "s_validate" });
+		const t = task({ id: "t" });
+		const candidates = candidateDependencyTasks(t, [bl, ac, bk, vl, t]);
+		expect(candidates.map((c) => c.id)).toEqual(["bl", "ac", "bk", "vl"]);
+	});
+
+	test("excludes tasks with a different cwd", () => {
+		const sameProject = task({ id: "same", cwd: "/project/a" });
+		const otherProject = task({ id: "other", cwd: "/project/b" });
+		const t = task({ id: "t", cwd: "/project/a" });
+		const candidates = candidateDependencyTasks(t, [sameProject, otherProject, t]);
+		expect(candidates.map((c) => c.id)).toEqual(["same"]);
+	});
+
+	test("excludes tasks with a cwd when caller has none (both must be null)", () => {
+		const withCwd = task({ id: "cwded", cwd: "/project/a" });
+		const noCwd = task({ id: "nocwd" });
+		const t = task({ id: "t" }); // no cwd
+		const candidates = candidateDependencyTasks(t, [withCwd, noCwd, t]);
+		expect(candidates.map((c) => c.id)).toEqual(["nocwd"]);
+	});
+
+	test("matches when both task and candidate have the same cwd", () => {
+		const a = task({ id: "a", displayId: 1, cwd: "/repo" });
+		const b = task({ id: "b", displayId: 2, cwd: "/repo" });
+		const t = task({ id: "t", cwd: "/repo" });
+		const candidates = candidateDependencyTasks(t, [a, b, t]);
+		expect(candidates.map((c) => c.id)).toEqual(["a", "b"]);
+	});
+
+	test("DEPENDENCY_ELIGIBLE_STATE_IDS contains exactly the four system states", () => {
+		expect(Object.keys(DEPENDENCY_ELIGIBLE_STATE_IDS).sort()).toEqual(
+			["s_active", "s_backlog", "s_blocked", "s_validate"],
+		);
 	});
 });

@@ -45,7 +45,7 @@ const log = logger("server");
 
 async function main(): Promise<void> {
 	const config = loadConfig();
-	await initializeSdkSettings(config.defaultCwd);
+	await initializeSdkSettings(config.defaultCwd, config.agentDir);
 	log.info(`omp-deck server starting`, {
 		host: config.host,
 		port: config.port,

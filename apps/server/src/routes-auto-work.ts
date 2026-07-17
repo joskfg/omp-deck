@@ -36,12 +36,21 @@ import type { Config } from "./config.ts";
 import { isCwdAllowed } from "./routes-fs.ts";
 import { getAutoWorkConfig, setAutoWorkConfig } from "./db/auto-work.ts";
 import { getAutoWorkGlobalConfig, setAutoWorkGlobalConfig } from "./db/auto-work-global.ts";
-import { completeAutoWorkRun, getAutoWorkCostEstimate, getAutoWorkRun, listAutoWorkRuns } from "./db/auto-work-runs.ts";
+import { completeAutoWorkRun, deleteAutoWorkRun, getAutoWorkCostEstimate, getAutoWorkRun, listAutoWorkRuns } from "./db/auto-work-runs.ts";
 import { getDeckBaseUrl as getServerDeckBaseUrl } from "./db/server-settings.ts";
 import { getTask, updateTask } from "./db/tasks.ts";
-import { appendAgentHistoryEntry, reconcileInactiveAutoWorkRuns, reconcileAutoMergedRuns, runGlobalAutoWorkCycle, createPullRequestViaGh } from "./auto-work/engine.ts";
+import {
+	appendAgentHistoryEntry,
+	failAutoWorkRun,
+	hasActiveAutoWorkRunFinalizer,
+	markRunIntentionallyStopped,
+	reconcileAutoMergedRuns,
+	reconcileInactiveAutoWorkRuns,
+	runGlobalAutoWorkCycle,
+	createPullRequestViaGh,
+	buildAutoWorkPrMessage,
+} from "./auto-work/engine.ts";
 import type { RunAutoWorkCycleOptions } from "./auto-work/engine.ts";
-import { buildSessionUrl } from "./deck-links.ts";
 import { broadcastBus } from "./broadcast-bus.ts";
 import { getScheduleStatus, updateGlobalSchedule, recordManualTrigger } from "./auto-work/scheduler.ts";
 import { logger } from "./log.ts";
@@ -50,6 +59,7 @@ import { getModelCatalogOverlay } from "./model-catalog-overlay.ts";
 const log = logger("routes:auto-work");
 
 const TASK_PRIORITIES: TaskPriority[] = ["P0", "P1", "P2", "P3", "P4", "P5"];
+const TASK_DIFFICULTIES: Record<string, true> = { easy: true, medium: true, hard: true };
 const RUN_STATUSES: AutoWorkRunStatus[] = ["running", "completed", "completed_pr_failed", "failed", "timed_out"];
 
 export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOptions: RunAutoWorkCycleOptions = {}): Hono {
@@ -88,11 +98,18 @@ export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOp
 			if (invalid) return c.json({ error: `${priority}: ${invalid}` }, 400);
 		}
 
+		for (const difficulty of Object.keys(TASK_DIFFICULTIES)) {
+			const ref = body.modelByDifficulty[difficulty as keyof typeof body.modelByDifficulty];
+			if (ref === null) continue;
+			const invalid = await validateModelRef(bridge, ref);
+			if (invalid) return c.json({ error: `modelByDifficulty.${difficulty}: ${invalid}` }, 400);
+		}
 		try {
 			const saved = setAutoWorkConfig(cwd, {
 				enabled: body.enabled,
 				autoMerge: body.autoMerge,
 				modelByPriority: body.modelByPriority,
+				modelByDifficulty: body.modelByDifficulty,
 				timeWindows: body.timeWindows,
 				sessionPctLimit: body.sessionPctLimit,
 				weeklyPctLimit: body.weeklyPctLimit,
@@ -146,6 +163,53 @@ export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOp
 		return c.json(response);
 	});
 
+	// ─── Stop / delete ─────────────────────────────────────────────────────────
+
+	// Aborts a running run (T-95). Only actually aborts the live session when
+	// this process has a finalizer awaiting its terminal event (see
+	// `hasActiveAutoWorkRunFinalizer`) — `settleAutoWorkRun` is already
+	// awaiting the result and owns closing out the DB row, so writing to it
+	// here too would race it. A `bridge.getSession()` hit alone is NOT
+	// enough: a server restart can resurrect a persisted handle with nothing
+	// in this process watching it finish (T-106), so that case — like the
+	// no-handle case — closes the row directly the same way
+	// `reconcileInactiveAutoWorkRuns` does for stale rows.
+	app.post("/auto-work/runs/:id/stop", async (c) => {
+		const runId = c.req.param("id");
+		const run = getAutoWorkRun(runId);
+		if (!run) return c.json({ error: "run not found" }, 404);
+		if (run.status !== "running") return c.json({ error: `run is not running (status: ${run.status})` }, 400);
+
+		const handle = bridge.getSession(run.sessionId);
+		if (handle && hasActiveAutoWorkRunFinalizer(runId)) {
+			try {
+				markRunIntentionallyStopped(runId);
+				await handle.abort();
+			} catch (err) {
+				log.error(`run ${runId}: stop failed`, err);
+				return c.json({ error: String(err) }, 500);
+			}
+			return c.json({ ok: true });
+		}
+
+		failAutoWorkRun(run.id, run.taskId, "stopped by user (no active session)");
+		log.info(`run ${runId}: stopped by user (no live finalizer for this run)`);
+		return c.json({ ok: true });
+	});
+
+	// Deletes a run's history row (T-95). Running runs must be stopped first
+	// so the in-flight cycle never writes to a row that no longer exists.
+	app.delete("/auto-work/runs/:id", (c) => {
+		const runId = c.req.param("id");
+		const run = getAutoWorkRun(runId);
+		if (!run) return c.json({ error: "run not found" }, 404);
+		if (run.status === "running") return c.json({ error: "run is still running; stop it before deleting" }, 409);
+
+		deleteAutoWorkRun(runId);
+		broadcastBus.broadcast({ type: "auto_work_runs_changed" });
+		return c.json({ ok: true });
+	});
+
 	// ─── PR retry ─────────────────────────────────────────────────────────────
 
 	// Retries `gh pr create` for a run whose implementation completed but PR
@@ -166,15 +230,11 @@ export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOp
 		const task = getTask(run.taskId);
 		if (!task) return c.json({ error: "task not found for run" }, 404);
 
-		const deckBaseUrl = getServerDeckBaseUrl(config).deckBaseUrl;
-		const sessionUrl = buildSessionUrl(deckBaseUrl, run.sessionId);
-
 		try {
 			const createPr = cycleOptions.createPullRequest ?? createPullRequestViaGh;
 			const pr = await createPr({
 				cwd: run.worktreePath,
-				title: `feat: T-${task.displayId} ${task.title}`,
-				body: `Auto Work completed T-${task.displayId}: ${task.title}\n\nSession: ${sessionUrl}`,
+				...buildAutoWorkPrMessage(task, run.sessionId),
 			});
 
 			completeAutoWorkRun(runId, {
@@ -232,6 +292,13 @@ export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOp
 			const invalid = await validateModelRef(bridge, body.taskSelectionModel);
 			if (invalid) return c.json({ error: `taskSelectionModel: ${invalid}` }, 400);
 		}
+		for (const difficulty of Object.keys(TASK_DIFFICULTIES)) {
+			const ref = body.modelByDifficulty[difficulty as keyof typeof body.modelByDifficulty];
+			if (ref === null) continue;
+			const invalid = await validateModelRef(bridge, ref);
+			if (invalid) return c.json({ error: `modelByDifficulty.${difficulty}: ${invalid}` }, 400);
+		}
+
 
 		try {
 			const saved: AutoWorkGlobalConfig = setAutoWorkGlobalConfig({
@@ -239,6 +306,7 @@ export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOp
 				scheduleIntervalMinutes: body.scheduleIntervalMinutes,
 				taskSelectionModel: body.taskSelectionModel,
 				squeezeEnabled: body.squeezeEnabled,
+				modelByDifficulty: body.modelByDifficulty,
 			});
 			// Reconfigure the in-process scheduler immediately.
 			updateGlobalSchedule(saved, bridge, {
@@ -341,6 +409,19 @@ function validateWorkspaceShape(body: SetAutoWorkConfigRequest): string | undefi
 			return `timeoutMinutesByPriority.${priority} must be a positive number`;
 	}
 
+	if (typeof body.modelByDifficulty !== "object" || body.modelByDifficulty === null) {
+		return "modelByDifficulty must be an object";
+	}
+	for (const difficulty of Object.keys(TASK_DIFFICULTIES)) {
+		const ref = (body.modelByDifficulty as Record<string, unknown>)[difficulty];
+		if (ref === undefined) return `modelByDifficulty.${difficulty} is required (use null for no override)`;
+		if (ref === null) continue;
+		if (typeof ref !== "object" || typeof (ref as Record<string, unknown>).provider !== "string" || typeof (ref as Record<string, unknown>).id !== "string") {
+			return `modelByDifficulty.${difficulty} must be null or {provider, id}`;
+		}
+	}
+
+
 	return undefined;
 }
 
@@ -359,6 +440,17 @@ function validateGlobalShape(body: SetAutoWorkGlobalConfigRequest): string | und
 		) return "taskSelectionModel must be null or {provider, id}";
 	}
 	if (typeof body.squeezeEnabled !== "boolean") return "squeezeEnabled must be a boolean";
+	if (typeof body.modelByDifficulty !== "object" || body.modelByDifficulty === null) {
+		return "modelByDifficulty must be an object";
+	}
+	for (const difficulty of Object.keys(TASK_DIFFICULTIES)) {
+		const ref = (body.modelByDifficulty as Record<string, unknown>)[difficulty];
+		if (ref === undefined) return `modelByDifficulty.${difficulty} is required (use null for no override)`;
+		if (ref === null) continue;
+		if (typeof ref !== "object" || typeof (ref as Record<string, unknown>).provider !== "string" || typeof (ref as Record<string, unknown>).id !== "string") {
+			return `modelByDifficulty.${difficulty} must be null or {provider, id}`;
+		}
+	}
 	return undefined;
 }
 async function validateModelRef(bridge: AgentBridge, ref: ModelRef): Promise<string | undefined> {

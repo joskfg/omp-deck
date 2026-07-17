@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Plus, RefreshCw, Trash2 } from "lucide-react";
+import { GitBranch, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { SessionLaunchModal, type SessionLaunchOpts } from "@/components/chat/SessionLaunchModal";
 import { launchSession } from "@/lib/first-prompt";
 import { useStore } from "@/lib/store";
@@ -122,18 +122,19 @@ export function Sidebar() {
 
 			<div className="flex-1 overflow-y-auto px-1 pb-3">
 				{liveSessions.map((s) => (
-					<SessionRow
-						key={s.sessionId}
-						id={s.sessionId}
-						title={s.sessionName || formatSessionId(s.sessionId)}
-						subtitle={shortPath(s.cwd, 30)}
-						active={s.sessionId === activeId}
-						live
-						planMode={s.planMode?.enabled === true}
-						goalStatus={s.goalMode?.status}
-						onClick={() => selectSession(s.sessionId)}
-						onDelete={handleDelete}
-					/>
+				<SessionRow
+					key={s.sessionId}
+					id={s.sessionId}
+					title={s.sessionName || formatSessionId(s.sessionId)}
+					subtitle={shortPath(s.cwd, 30)}
+					active={s.sessionId === activeId}
+					live
+					planMode={s.planMode?.enabled === true}
+					goalStatus={s.goalMode?.status}
+					forked={Boolean(s.parentSessionPath)}
+					onClick={() => selectSession(s.sessionId)}
+					onDelete={handleDelete}
+				/>
 				))}
 
 				{liveSessions.length > 0 && persisted.length > 0 ? (
@@ -141,15 +142,16 @@ export function Sidebar() {
 				) : null}
 
 				{persisted.map((s) => (
-					<SessionRow
-						key={s.id}
-						id={s.id}
-						title={s.title || formatSessionId(s.id)}
-						subtitle={`${shortPath(s.cwd, 26)}${s.durationMs != null ? ` · ${formatDurationMs(s.durationMs)}` : ""}`}
-						meta={formatTimestamp(s.createdAt)}
-						onClick={() => void handleResume(s.path)}
-						onDelete={handleDelete}
-					/>
+				<SessionRow
+					key={s.id}
+					id={s.id}
+					title={s.title || formatSessionId(s.id)}
+					subtitle={`${shortPath(s.cwd, 26)}${s.durationMs != null ? ` · ${formatDurationMs(s.durationMs)}` : ""}`}
+					meta={formatTimestamp(s.createdAt)}
+					forked={Boolean(s.parentPath)}
+					onClick={() => void handleResume(s.path)}
+					onDelete={handleDelete}
+				/>
 				))}
 
 				{filtered.length === 0 && liveSessions.length === 0 ? (
@@ -177,6 +179,7 @@ function SessionRow({
 	live,
 	planMode,
 	goalStatus,
+	forked,
 	onClick,
 	onDelete,
 }: {
@@ -190,6 +193,9 @@ function SessionRow({
 	/** Goal Mode status, when this session has an active/paused objective. Mutually
 	 * exclusive with `planMode` (a session is never in both at once). */
 	goalStatus?: "active" | "paused" | "budget-limited" | "complete" | "dropped";
+	/** True when this session's header records a `parentSession` — it was
+	 *  forked/handed-off from another session (T-31). */
+	forked?: boolean;
 	onClick: () => void;
 	/** Delete this session (trash icon, hover-revealed). Confirms + deletes
 	 *  both live and persisted rows — see `Sidebar`'s `handleDelete`. */
@@ -214,6 +220,11 @@ function SessionRow({
 						<span className="h-1.5 w-1.5 shrink-0 rounded-full bg-line-strong" />
 					)}
 					<span className="truncate">{title}</span>
+					{forked ? (
+						<span title="Bifurcada de otra sesión">
+							<GitBranch className="h-3 w-3 shrink-0 text-ink-4" aria-label="forked session" />
+						</span>
+					) : null}
 					{planMode ? (
 						<span
 							className="ml-auto shrink-0 rounded border border-thinking/40 bg-thinking/10 px-1 py-px font-mono text-[10px] uppercase tracking-meta text-thinking"

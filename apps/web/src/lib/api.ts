@@ -2,11 +2,17 @@ import type {
 	ApplyDelegationArtifactRequest,
 	ApplyDelegationArtifactResponse,
 	AdvisorSettingsResponse,
+	AggregatedStatsResponse,
 	AutoWorkConfig,
 	AutoWorkCycleResult,
 	AutoWorkGlobalConfig,
 	AutoWorkRunStatus,
 	AutoWorkScheduleStatus,
+	BranchSessionRequest,
+	CodebaseMemoryIndexResult,
+	CodebaseMemoryMcpStatus,
+	CodebaseMemoryOverview,
+	CodebaseMemoryQueryResult,
 	CreateSessionRequest,
 	CreateSessionResponse,
 	DeckBaseUrlResponse,
@@ -14,6 +20,23 @@ import type {
 	DiscardDelegationArtifactRequest,
 	DiscardDelegationArtifactResponse,
 	GetDelegationSettingsResponse,
+	CreateHindsightMentalModelRequest,
+	CreateHindsightMentalModelResponse,
+	DeleteHindsightDocumentResponse,
+	DeleteHindsightMentalModelResponse,
+	GetMemorySettingsResponse,
+	HindsightDocument,
+	HindsightListDocumentsResponse,
+	HindsightListMemoriesResponse,
+	HindsightRecallRequest,
+	HindsightRecallResponse,
+	ListHindsightMentalModelsResponse,
+	MemoryScopeStatus,
+	PatchMemorySettingsRequest,
+	PatchMemorySettingsResponse,
+	RefreshHindsightMentalModelResponse,
+	UpdateHindsightDocumentRequest,
+	GetSessionHandoffSuccessorResponse,
 	InternalTaskModelResponse,
 	ListAutoWorkRunsResponse,
 	ListDirResponse,
@@ -21,25 +44,33 @@ import type {
 	ListModelsResponse,
 	ListSessionsResponse,
 	ListSessionMonitorResponse,
+	ListSessionUsageResponse,
 	ListSlashCommandsResponse,
 	ListTasksResponse,
 	ListWorkspacePreferencesResponse,
 	ListWorkspacesResponse,
+	AddWorkspaceRequest,
 	ModelRef,
+	OmpStatsRange,
 	PatchDelegationSettingsRequest,
 	PatchDelegationSettingsResponse,
+	GetPolicySettingsResponse,
+	PatchPolicySettingsRequest,
+	PatchPolicySettingsResponse,
+	PlanModelResponse,
+	QueryCodebaseMemoryRequest,
 	RewriteTaskRequest,
 	RewriteTaskResponse,
 	SessionHistoryResponse,
+	SessionTreeResponse,
+	SetAdvisorSettingsRequest,
 	SetAutoWorkConfigRequest,
 	SetAutoWorkGlobalConfigRequest,
 	SetDeckBaseUrlRequest,
 	SetInternalTaskModelRequest,
-	PlanModelResponse,
 	SetPlanModelRequest,
-	SpendSummaryResponse,
 	SetTaskRewriteModelRequest,
-	SetAdvisorSettingsRequest,
+	SpendSummaryResponse,
 	SubscriptionUsageResponse,
 	TaskPriority,
 	TaskRewriteModelResponse,
@@ -70,8 +101,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+	getAppTitle(): Promise<{ title: string }> {
+		return request<{ title: string }>("/health");
+	},
 	listWorkspaces(): Promise<ListWorkspacesResponse> {
 		return request<ListWorkspacesResponse>("/workspaces");
+	},
+	addWorkspace(cwd: string): Promise<{ ok: true }> {
+		return request<{ ok: true }>("/workspaces", {
+			method: "POST",
+			body: JSON.stringify({ cwd } satisfies AddWorkspaceRequest),
+		});
+	},
+	removeWorkspace(cwd: string): Promise<{ ok: true }> {
+		return request<{ ok: true }>(`/workspaces?cwd=${encodeURIComponent(cwd)}`, {
+			method: "DELETE",
+		});
 	},
 	listSessions(cwd?: string): Promise<ListSessionsResponse> {
 		const q = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
@@ -84,6 +129,24 @@ export const api = {
 	sessionHistory(id: string, before: number, limit: number): Promise<SessionHistoryResponse> {
 		return request<SessionHistoryResponse>(
 			`/sessions/${encodeURIComponent(id)}/history?before=${before}&limit=${limit}`,
+		);
+	},
+	sessionTree(id: string): Promise<SessionTreeResponse> {
+		return request<SessionTreeResponse>(`/sessions/${encodeURIComponent(id)}/tree`);
+	},
+	branchSession(id: string, entryId: string): Promise<CreateSessionResponse> {
+		const body: BranchSessionRequest = { entryId };
+		return request<CreateSessionResponse>(`/sessions/${encodeURIComponent(id)}/branch`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		});
+	},
+	/** T-32: best-effort lookup of the session an automatic context handoff
+	 *  continued into, if any. Bridge-independent — works for a purely
+	 *  historical (non-live) session too. */
+	getHandoffSuccessor(cwd: string, sessionFile: string): Promise<GetSessionHandoffSuccessorResponse> {
+		return request<GetSessionHandoffSuccessorResponse>(
+			`/sessions/handoff-successor?cwd=${encodeURIComponent(cwd)}&sessionFile=${encodeURIComponent(sessionFile)}`,
 		);
 	},
 	createSession(body: CreateSessionRequest): Promise<CreateSessionResponse> {
@@ -109,6 +172,12 @@ export const api = {
 		return request(`/sessions/${encodeURIComponent(id)}`, {
 			method: "PATCH",
 			body: JSON.stringify({ model }),
+		});
+	},
+	setSessionThinking(id: string, thinking: string): Promise<{ ok: true; sessionId: string }> {
+		return request(`/sessions/${encodeURIComponent(id)}`, {
+			method: "PATCH",
+			body: JSON.stringify({ thinking }),
 		});
 	},
 	compactSession(id: string, focus?: string): Promise<{ ok: true }> {
@@ -153,6 +222,29 @@ export const api = {
 			body: JSON.stringify(config),
 		});
 	},
+	getCodebaseMemoryMcpStatus(cwd: string): Promise<CodebaseMemoryMcpStatus> {
+		return request<CodebaseMemoryMcpStatus>(`/workspace-mcp/codebase-memory?cwd=${encodeURIComponent(cwd)}`);
+	},
+	setCodebaseMemoryMcpEnabled(cwd: string, enabled: boolean): Promise<CodebaseMemoryMcpStatus> {
+		return request<CodebaseMemoryMcpStatus>(`/workspace-mcp/codebase-memory?cwd=${encodeURIComponent(cwd)}`, {
+			method: "PUT",
+			body: JSON.stringify({ enabled }),
+		});
+	},
+	getCodebaseMemoryOverview(cwd: string): Promise<CodebaseMemoryOverview> {
+		return request<CodebaseMemoryOverview>(`/workspace-mcp/codebase-memory/overview?cwd=${encodeURIComponent(cwd)}`);
+	},
+	queryCodebaseMemory(cwd: string, body: QueryCodebaseMemoryRequest): Promise<CodebaseMemoryQueryResult> {
+		return request<CodebaseMemoryQueryResult>(`/workspace-mcp/codebase-memory/query?cwd=${encodeURIComponent(cwd)}`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		});
+	},
+	indexCodebaseMemory(cwd: string): Promise<CodebaseMemoryIndexResult> {
+		return request<CodebaseMemoryIndexResult>(`/workspace-mcp/codebase-memory/index?cwd=${encodeURIComponent(cwd)}`, {
+			method: "POST",
+		});
+	},
 	getDeckBaseUrl(): Promise<DeckBaseUrlResponse> {
 		return request<DeckBaseUrlResponse>("/settings/deck-base-url");
 	},
@@ -191,6 +283,12 @@ export const api = {
 			{ method: "POST" },
 		);
 	},
+	stopAutoWorkRun(runId: string): Promise<{ ok: true }> {
+		return request<{ ok: true }>(`/auto-work/runs/${encodeURIComponent(runId)}/stop`, { method: "POST" });
+	},
+	deleteAutoWorkRun(runId: string): Promise<{ ok: true }> {
+		return request<{ ok: true }>(`/auto-work/runs/${encodeURIComponent(runId)}`, { method: "DELETE" });
+	},
 	triggerAutoWork(): Promise<AutoWorkCycleResult> {
 		return request<AutoWorkCycleResult>(`/auto-work/trigger`, { method: "POST" });
 	},
@@ -212,6 +310,23 @@ export const api = {
 	},
 	getAccountSpendSummary(): Promise<SpendSummaryResponse> {
 		return request<SpendSummaryResponse>(`/usage/spend`);
+	},
+	listSessionUsage(limit = 20): Promise<ListSessionUsageResponse> {
+		return request<ListSessionUsageResponse>(`/usage/sessions?limit=${limit}`);
+	},
+	getAggregatedStats(opts: {
+		range?: OmpStatsRange;
+		cwd?: string;
+		model?: string;
+		agentType?: "main" | "subagent" | "advisor";
+	} = {}): Promise<AggregatedStatsResponse> {
+		const params = new URLSearchParams();
+		if (opts.range) params.set("range", opts.range);
+		if (opts.cwd) params.set("cwd", opts.cwd);
+		if (opts.model) params.set("model", opts.model);
+		if (opts.agentType) params.set("agentType", opts.agentType);
+		const qs = params.toString();
+		return request<AggregatedStatsResponse>(`/usage/stats${qs ? `?${qs}` : ""}`);
 	},
 	listTasks(): Promise<ListTasksResponse> {
 		return request<ListTasksResponse>("/tasks");
@@ -258,6 +373,15 @@ export const api = {
 			body: JSON.stringify(body),
 		});
 	},
+	getPolicySettings(): Promise<GetPolicySettingsResponse> {
+		return request<GetPolicySettingsResponse>("/policies/settings");
+	},
+	patchPolicySettings(body: PatchPolicySettingsRequest): Promise<PatchPolicySettingsResponse> {
+		return request<PatchPolicySettingsResponse>("/policies/settings", {
+			method: "PATCH",
+			body: JSON.stringify(body),
+		});
+	},
 	getDelegationArtifact(path: string): Promise<DelegationArtifactResponse> {
 		return request<DelegationArtifactResponse>(`/delegation/artifact?path=${encodeURIComponent(path)}`);
 	},
@@ -272,5 +396,69 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify(body),
 		});
+	},
+	getMemorySettings(): Promise<GetMemorySettingsResponse> {
+		return request<GetMemorySettingsResponse>("/memory/settings");
+	},
+	patchMemorySettings(body: PatchMemorySettingsRequest): Promise<PatchMemorySettingsResponse> {
+		return request<PatchMemorySettingsResponse>("/memory/settings", {
+			method: "PATCH",
+			body: JSON.stringify(body),
+		});
+	},
+	getMemoryScope(cwd: string): Promise<MemoryScopeStatus> {
+		return request<MemoryScopeStatus>(`/memory/scope?cwd=${encodeURIComponent(cwd)}`);
+	},
+	listHindsightMemories(cwd: string, params: { q?: string; type?: string; limit?: number; offset?: number } = {}): Promise<HindsightListMemoriesResponse> {
+		const q = new URLSearchParams({ cwd });
+		if (params.q) q.set("q", params.q);
+		if (params.type) q.set("type", params.type);
+		if (params.limit !== undefined) q.set("limit", String(params.limit));
+		if (params.offset !== undefined) q.set("offset", String(params.offset));
+		return request<HindsightListMemoriesResponse>(`/memory/hindsight/memories?${q.toString()}`);
+	},
+	recallHindsightMemory(cwd: string, body: HindsightRecallRequest): Promise<HindsightRecallResponse> {
+		return request<HindsightRecallResponse>(`/memory/hindsight/recall?cwd=${encodeURIComponent(cwd)}`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		});
+	},
+	listHindsightDocuments(cwd: string, params: { limit?: number; offset?: number } = {}): Promise<HindsightListDocumentsResponse> {
+		const q = new URLSearchParams({ cwd });
+		if (params.limit !== undefined) q.set("limit", String(params.limit));
+		if (params.offset !== undefined) q.set("offset", String(params.offset));
+		return request<HindsightListDocumentsResponse>(`/memory/hindsight/documents?${q.toString()}`);
+	},
+	updateHindsightDocument(cwd: string, documentId: string, body: UpdateHindsightDocumentRequest): Promise<HindsightDocument> {
+		return request<HindsightDocument>(`/memory/hindsight/documents/${encodeURIComponent(documentId)}?cwd=${encodeURIComponent(cwd)}`, {
+			method: "PATCH",
+			body: JSON.stringify(body),
+		});
+	},
+	deleteHindsightDocument(cwd: string, documentId: string): Promise<DeleteHindsightDocumentResponse> {
+		return request<DeleteHindsightDocumentResponse>(`/memory/hindsight/documents/${encodeURIComponent(documentId)}?cwd=${encodeURIComponent(cwd)}`, {
+			method: "DELETE",
+		});
+	},
+	listHindsightMentalModels(cwd: string): Promise<ListHindsightMentalModelsResponse> {
+		return request<ListHindsightMentalModelsResponse>(`/memory/hindsight/mental-models?cwd=${encodeURIComponent(cwd)}`);
+	},
+	createHindsightMentalModel(cwd: string, body: CreateHindsightMentalModelRequest): Promise<CreateHindsightMentalModelResponse> {
+		return request<CreateHindsightMentalModelResponse>(`/memory/hindsight/mental-models?cwd=${encodeURIComponent(cwd)}`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		});
+	},
+	refreshHindsightMentalModel(cwd: string, mentalModelId: string): Promise<RefreshHindsightMentalModelResponse> {
+		return request<RefreshHindsightMentalModelResponse>(
+			`/memory/hindsight/mental-models/${encodeURIComponent(mentalModelId)}/refresh?cwd=${encodeURIComponent(cwd)}`,
+			{ method: "POST" },
+		);
+	},
+	deleteHindsightMentalModel(cwd: string, mentalModelId: string): Promise<DeleteHindsightMentalModelResponse> {
+		return request<DeleteHindsightMentalModelResponse>(
+			`/memory/hindsight/mental-models/${encodeURIComponent(mentalModelId)}?cwd=${encodeURIComponent(cwd)}`,
+			{ method: "DELETE" },
+		);
 	},
 };

@@ -17,7 +17,7 @@ import { SETTINGS_SCHEMA, Settings } from "@oh-my-pi/pi-coding-agent/config/sett
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import { cleanupTaskBranches, getRepoRoot, mergeTaskBranches } from "@oh-my-pi/pi-coding-agent/task/worktree";
 
-import { isCwdAllowed } from "./routes-fs.ts";
+import { cwdNotAllowedMessage, isCwdAllowed, pathNotAllowedMessage } from "./routes-fs.ts";
 
 /**
  * Delegation governance is a projection of OMP's own settings store. The deck
@@ -118,7 +118,7 @@ export function buildDelegationRouter(): Hono {
 			return c.json({ error: "invalid json body" }, 400);
 		}
 		if (!body.cwd || !path.isAbsolute(body.cwd) || !isCwdAllowed(body.cwd)) {
-			return c.json({ error: "cwd is not under an allowed root" }, 403);
+			return c.json({ error: cwdNotAllowedMessage() }, 403);
 		}
 		if (!!body.patchPath === !!body.branchName) {
 			return c.json({ error: "provide exactly one of patchPath or branchName" }, 400);
@@ -181,7 +181,7 @@ export function buildDelegationRouter(): Hono {
 			return c.json({ error: "invalid json body" }, 400);
 		}
 		if (!body.cwd || !path.isAbsolute(body.cwd) || !isCwdAllowed(body.cwd)) {
-			return c.json({ error: "cwd is not under an allowed root" }, 403);
+			return c.json({ error: cwdNotAllowedMessage() }, 403);
 		}
 		if (!!body.patchPath === !!body.branchName) {
 			return c.json({ error: "provide exactly one of patchPath or branchName" }, 400);
@@ -237,7 +237,7 @@ async function buildSettingsResponse(existing?: Settings): Promise<GetDelegation
 async function validatePatchArtifact(artifactPath: string | undefined): Promise<{ message: string; status: 400 | 403 | 404 } | null> {
 	if (!artifactPath || !path.isAbsolute(artifactPath)) return { message: "path must be an absolute patch path", status: 400 };
 	if (!artifactPath.endsWith(".patch")) return { message: "artifact path must end in .patch", status: 400 };
-	if (!isCwdAllowed(path.dirname(artifactPath))) return { message: "artifact path is not under an allowed root", status: 403 };
+	if (!isCwdAllowed(path.dirname(artifactPath))) return { message: pathNotAllowedMessage("artifact path"), status: 403 };
 	try {
 		const stat = await fs.stat(artifactPath);
 		if (!stat.isFile()) return { message: "artifact is not a file", status: 400 };

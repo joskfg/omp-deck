@@ -195,6 +195,25 @@ describe("notify — weekly threshold dedup", () => {
 		expect(fetchCalls).toHaveLength(2); // unchanged — same UTC calendar day
 	});
 
+	test("retries later that day when every recipient delivery fails", async () => {
+		configureTelegram();
+		const now = new Date("2026-01-01T09:00:00.000Z");
+		globalThis.fetch = (async (url: string, init?: RequestInit) => {
+			fetchCalls.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : undefined });
+			throw new Error("network unreachable");
+		}) as unknown as typeof fetch;
+
+		await notify({ kind: "weekly_threshold", cwd: "/tmp/ws-retry", pctUsed: 85, thresholdPct: 80 }, now);
+		expect(fetchCalls).toHaveLength(2);
+
+		stubFetchOk();
+		await notify({ kind: "weekly_threshold", cwd: "/tmp/ws-retry", pctUsed: 85, thresholdPct: 80 }, now);
+		expect(fetchCalls).toHaveLength(4);
+
+		await notify({ kind: "weekly_threshold", cwd: "/tmp/ws-retry", pctUsed: 85, thresholdPct: 80 }, now);
+		expect(fetchCalls).toHaveLength(4);
+	});
+
 	test("sends again once the calendar day rolls over", async () => {
 		configureTelegram();
 		stubFetchOk();

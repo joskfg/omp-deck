@@ -13,7 +13,13 @@ import type { UsageReport } from "@oh-my-pi/pi-ai";
 
 import type { AgentBridge } from "./bridge/types.ts";
 import type { Config } from "./config.ts";
-import type { SessionSummary, SubscriptionUsageResponse, ListSessionUsageResponse, SpendSummaryResponse } from "@omp-deck/protocol";
+import type {
+	AggregatedStatsResponse,
+	SessionSummary,
+	SubscriptionUsageResponse,
+	ListSessionUsageResponse,
+	SpendSummaryResponse,
+} from "@omp-deck/protocol";
 import { buildUsageRouter } from "./routes-usage.ts";
 import { resetSubscriptionUsageCacheForTests } from "./usage-subscription.ts";
 
@@ -204,21 +210,141 @@ describe("GET /usage/spend", () => {
 		const entry = body.accounts.find((a) => a.cwd === fakeConfig().defaultCwd);
 		expect(entry).toBeDefined();
 		expect(entry).toMatchObject({ day: 0, week: 0, month: 0 });
+		expect(typeof entry?.label).toBe("string");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// GET /usage/stats
+// ---------------------------------------------------------------------------
+
+/** Minimal valid AggregatedStatsResponse for use as a stub return value. */
+function stubStatsResponse(overrides: Partial<AggregatedStatsResponse> = {}): AggregatedStatsResponse {
+	return {
+		range: "7d",
+		source: "sessions",
+		syncInProgress: false,
+		total: { costUsd: 1.5, totalTokens: 3000, requests: 10 },
+		byModel: [
+			{
+				model: "claude-sonnet-4-6",
+				provider: "anthropic",
+				costUsd: 1.5,
+				totalTokens: 3000,
+				requests: 10,
+				sessionLinks: [{ sessionId: "sess-abc", title: "My session", cwd: "/project", agentType: "main" }],
+			},
+		],
+		byWorkspace: [{ cwd: "/project", label: "project", costUsd: 1.5, totalTokens: 3000, requests: 10 }],
+		byAgentType: [{ agentType: "main", costUsd: 1.5, totalTokens: 3000, requests: 10 }],
+		...overrides,
+	};
+}
+
+describe("GET /usage/stats", () => {
+	test("returns 200 with the AggregatedStatsResponse shape from the stub", async () => {
+		const stub = stubStatsResponse();
+		const app = buildUsageRouter(fakeBridge([]), fakeConfig(), {
+			statsOverride: async () => stub,
+		});
+
+		const res = await app.request("/usage/stats");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as AggregatedStatsResponse;
+		expect(body.source).toBe("sessions");
+		expect(body.range).toBe("7d");
+		expect(typeof body.syncInProgress).toBe("boolean");
+		expect(Array.isArray(body.byModel)).toBe(true);
+		expect(Array.isArray(body.byWorkspace)).toBe(true);
+		expect(Array.isArray(body.byAgentType)).toBe(true);
+		expect(body.total.costUsd).toBe(1.5);
 	});
 
-	test("every account entry has cwd/label/day/week/month with the expected JS types", async () => {
-		const app = buildUsageRouter(fakeBridge([]), fakeConfig());
-		const res = await app.request("/usage/spend");
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as SpendSummaryResponse;
+	test("parses range query param and forwards it to the stats impl", async () => {
+		let capturedOpts: Record<string, unknown> = {};
+		const app = buildUsageRouter(fakeBridge([]), fakeConfig(), {
+			statsOverride: async (_bridge, opts) => {
+				capturedOpts = opts as Record<string, unknown>;
+				return stubStatsResponse({ range: opts.range as AggregatedStatsResponse["range"] });
+			},
+		});
 
-		expect(body.accounts.length).toBeGreaterThan(0);
-		for (const entry of body.accounts) {
-			expect(typeof entry.cwd).toBe("string");
-			expect(typeof entry.label).toBe("string");
-			expect(typeof entry.day).toBe("number");
-			expect(typeof entry.week).toBe("number");
-			expect(typeof entry.month).toBe("number");
-		}
+		const res = await app.request("/usage/stats?range=30d");
+		expect(res.status).toBe(200);
+		expect(capturedOpts.range).toBe("30d");
+	});
+
+	test("parses cwd, model, and agentType query params and forwards them", async () => {
+		let capturedOpts: Record<string, unknown> = {};
+		const app = buildUsageRouter(fakeBridge([]), fakeConfig(), {
+			statsOverride: async (_bridge, opts) => {
+				capturedOpts = opts as Record<string, unknown>;
+				return stubStatsResponse();
+			},
+		});
+
+		const res = await app.request(
+			"/usage/stats?cwd=%2Fhome%2Fuser%2Fproject&model=claude-sonnet-4-6&agentType=main",
+		);
+		expect(res.status).toBe(200);
+		expect(capturedOpts.cwd).toBe("/home/user/project");
+		expect(capturedOpts.model).toBe("claude-sonnet-4-6");
+		expect(capturedOpts.agentType).toBe("main");
+	});
+
+	test("uses default range '7d' when no range param is given", async () => {
+		let capturedRange: string | undefined;
+		const app = buildUsageRouter(fakeBridge([]), fakeConfig(), {
+			statsOverride: async (_bridge, opts) => {
+				capturedRange = opts.range;
+				return stubStatsResponse();
+			},
+		});
+
+		const res = await app.request("/usage/stats");
+		expect(res.status).toBe(200);
+		expect(capturedRange).toBe("7d");
+	});
+
+	test("forwards the bridge to the stats impl", async () => {
+		const sessions: SessionSummary[] = [
+			{ id: "s1", path: "/sessions/p/s1.jsonl", cwd: "/project", title: "T", updatedAt: "", createdAt: "", messageCount: 0 },
+		];
+		let bridgePassed = false;
+		const app = buildUsageRouter(fakeBridge(sessions), fakeConfig(), {
+			statsOverride: async (bridge) => {
+				const listed = await bridge.listSessions({});
+				bridgePassed = listed.length === 1 && listed[0]?.id === "s1";
+				return stubStatsResponse();
+			},
+		});
+
+		const res = await app.request("/usage/stats");
+		expect(res.status).toBe(200);
+		expect(bridgePassed).toBe(true);
+	});
+
+	test("session links in byModel contain sessionId and agentType", async () => {
+		const stub = stubStatsResponse();
+		const app = buildUsageRouter(fakeBridge([]), fakeConfig(), {
+			statsOverride: async () => stub,
+		});
+
+		const res = await app.request("/usage/stats");
+		const body = (await res.json()) as AggregatedStatsResponse;
+		const modelRow = body.byModel[0]!;
+		expect(modelRow).toBeDefined();
+		const link = modelRow.sessionLinks[0]!;
+		expect(link).toBeDefined();
+		expect(link.sessionId).toBe("sess-abc");
+		expect(link.agentType).toBe("main");
+	});
+
+	test("source field is always 'sessions' (not routine data)", async () => {
+		const app = buildUsageRouter(fakeBridge([]), fakeConfig(), {
+			statsOverride: async () => stubStatsResponse(),
+		});
+		const body = (await (await app.request("/usage/stats")).json()) as AggregatedStatsResponse;
+		expect(body.source).toBe("sessions");
 	});
 });

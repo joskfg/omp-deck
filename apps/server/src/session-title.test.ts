@@ -221,6 +221,39 @@ describe("maybeAutoTitleSession", () => {
 		expect(setNameCalls).toEqual(["Fix The Login Bug"]);
 	});
 
+	test("deduplicates concurrent title requests for the same session", async () => {
+		setInternalTaskModel({ provider: "anthropic", id: "claude-good" });
+		const calls: GenerateTitleRequest[] = [];
+		const titleRequested = Promise.withResolvers<void>();
+		const titleResponse = Promise.withResolvers<string | null>();
+		const { handle, setNameCalls, snapshotCalls } = fakeHandle();
+		const sessionsChanged = new Promise<void>((resolve) => {
+			const stop = broadcastBus.subscribe((frame) => {
+				if (frame.type === "sessions_changed") {
+					stop();
+					resolve();
+				}
+			});
+		});
+		const bridge = {
+			async generateTitle(request: GenerateTitleRequest) {
+				calls.push(request);
+				titleRequested.resolve();
+				return titleResponse.promise;
+			},
+		} as unknown as AgentBridge;
+
+		maybeAutoTitleSession(bridge, handle, "Fix the login bug");
+		maybeAutoTitleSession(bridge, handle, "Fix the login bug");
+		await titleRequested.promise;
+
+		expect(snapshotCalls).toEqual([0]);
+		expect(calls).toHaveLength(1);
+		titleResponse.resolve("Fix the login bug");
+		await sessionsChanged;
+		expect(setNameCalls).toEqual(["Fix the login bug"]);
+	});
+
 	test("never renames a session that already has a sessionName", async () => {
 		setInternalTaskModel({ provider: "anthropic", id: "claude-good" });
 		const calls: GenerateTitleRequest[] = [];

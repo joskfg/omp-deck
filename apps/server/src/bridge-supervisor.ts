@@ -55,6 +55,8 @@ class LogRing {
 interface Tracked {
 	spec: BridgeSpec;
 	proc?: Subprocess;
+	startPromise?: Promise<BridgeInfo>;
+	startToken?: symbol;
 	startedAt?: number;
 	stoppedAt?: number;
 	status: BridgeStatus;
@@ -93,6 +95,7 @@ export class BridgeSupervisor {
 	async start(name: BridgeName): Promise<BridgeInfo> {
 		const t = this.requireBridge(name);
 		if (t.proc) return this.toInfo(t);
+		if (t.startPromise) return t.startPromise;
 
 		const missing = this.missingEnv(t.spec);
 		if (missing.length > 0) {
@@ -104,6 +107,21 @@ export class BridgeSupervisor {
 		t.lastError = undefined;
 		t.logs.clear();
 		t.status = "starting";
+
+		const token = Symbol(name);
+		t.startToken = token;
+		const startPromise = Promise.resolve().then(() => this.launch(t, name, token));
+		t.startPromise = startPromise;
+		try {
+			return await startPromise;
+		} finally {
+			if (t.startPromise === startPromise) t.startPromise = undefined;
+			if (t.startToken === token) t.startToken = undefined;
+		}
+	}
+
+	private launch(t: Tracked, name: BridgeName, token: symbol): BridgeInfo {
+		if (t.startToken !== token || t.stopRequested) return this.toInfo(t);
 
 		let proc: Subprocess;
 		try {
@@ -119,7 +137,11 @@ export class BridgeSupervisor {
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",
-				onExit: (_subprocess, exitCode, signalCode, _error) => {
+				onExit: (subprocess, exitCode, signalCode, _error) => {
+					// A delayed exit from a process that stop() already converged
+					// (and a subsequent start replaced) must not overwrite the
+					// current process's lifecycle state.
+					if (t.proc !== subprocess) return;
 					t.proc = undefined;
 					t.exitCode = exitCode ?? undefined;
 					t.exitSignal = signalCode != null ? String(signalCode) : undefined;
@@ -134,9 +156,23 @@ export class BridgeSupervisor {
 				},
 			});
 		} catch (err) {
-			t.status = "crashed";
-			t.lastError = String(err);
+			if (t.startToken === token) {
+				t.status = "crashed";
+				t.lastError = String(err);
+			}
 			throw err;
+		}
+
+		// stop() can cancel a scheduled start before this microtask launches.
+		// If a synchronous spawn hook re-entered and invalidated the token, do
+		// not leave the newly-created subprocess orphaned.
+		if (t.startToken !== token || t.stopRequested) {
+			try {
+				proc.kill();
+			} catch (err) {
+				log.warn(`bridge ${name} kill threw`, err);
+			}
+			return this.toInfo(t);
 		}
 
 		t.proc = proc;
@@ -155,6 +191,12 @@ export class BridgeSupervisor {
 	async stop(name: BridgeName): Promise<BridgeInfo> {
 		const t = this.requireBridge(name);
 		if (!t.proc) {
+			if (t.startPromise) {
+				t.stopRequested = true;
+				t.startToken = undefined;
+				t.status = "stopped";
+				await t.startPromise.catch(() => undefined);
+			}
 			t.status = "stopped";
 			return this.toInfo(t);
 		}

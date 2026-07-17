@@ -8,8 +8,10 @@ import type {
 	UpdateInboxItemRequest,
 } from "@omp-deck/protocol";
 
+import { broadcastBus } from "./broadcast-bus.ts";
+import { getDb } from "./db/index.ts";
 import { createInbox, deleteInbox, getInbox, listInbox, updateInbox } from "./db/inbox.ts";
-import { createTask, getDefaultState, getState } from "./db/tasks.ts";
+import { createTaskInTransaction, getDefaultState, getState } from "./db/tasks.ts";
 
 const KINDS: ReadonlySet<InboxKind> = new Set([
 	"email",
@@ -106,14 +108,17 @@ export function buildInboxRouter(): Hono {
 			: provenance;
 
 		try {
-			const task = createTask({ title: item.title, body: taskBody, stateId });
-			// markProcessed defaults to true. Caller passing `false` keeps the item
-			// in the unprocessed list (useful when promoting a recurring template).
-			const shouldMark = body.markProcessed !== false;
-			const inbox = shouldMark
-				? updateInbox(item.id, { processed: true }) ?? item
-				: item;
-			const out: PromoteInboxItemResponse = { task, inbox };
+			const out = getDb().transaction((): PromoteInboxItemResponse => {
+				const task = createTaskInTransaction({ title: item.title, body: taskBody, stateId });
+				// markProcessed defaults to true. Caller passing `false` keeps the item
+				// in the unprocessed list (useful when promoting a recurring template).
+				const shouldMark = body.markProcessed !== false;
+				const inbox = shouldMark
+					? updateInbox(item.id, { processed: true }) ?? item
+					: item;
+				return { task, inbox };
+			})();
+			broadcastBus.broadcast({ type: "tasks_changed" });
 			return c.json(out, 201);
 		} catch (err) {
 			return c.json({ error: String(err) }, 400);

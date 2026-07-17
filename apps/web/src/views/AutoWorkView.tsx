@@ -3,13 +3,16 @@
  *
  * Two-pane layout:
  *   Left  — run list sorted by startedAt desc; active runs pinned to the top.
- *   Right — detail pane for the selected run: task info, metrics,
- *            session link, and a live transcript preview for running sessions.
+ *   Right — detail pane for the selected run: task info, metrics, stop/delete
+ *           actions, and a session card. The transcript itself is never
+ *           re-rendered here — "Open in chat" routes to `/c/:sessionId`,
+ *           which mounts the existing `Chat` component (T-95), so there is
+ *           exactly one message renderer in the app.
  *
  * Real-time updates: `autoWorkRunsChangeCounter` bumps on every lifecycle
- * event (start / complete / fail / timeout) via the `auto_work_runs_changed`
- * WS broadcast.  `tasksChangeCounter` is also watched since the engine moves
- * tasks between states as runs progress.
+ * event (start / complete / fail / timeout / stop / delete) via the
+ * `auto_work_runs_changed` WS broadcast. `tasksChangeCounter` is also
+ * watched since the engine moves tasks between states as runs progress.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -17,7 +20,6 @@ import { useNavigate } from "react-router-dom";
 import {
 	Activity,
 	AlertTriangle,
-	ArrowUpRight,
 	BotMessageSquare,
 	CheckCircle2,
 	CircleDashed,
@@ -26,6 +28,8 @@ import {
 	GitPullRequest,
 	Play,
 	RefreshCw,
+	Square,
+	Trash2,
 	XCircle,
 	Zap,
 } from "lucide-react";
@@ -38,7 +42,6 @@ import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { formatBriefTime } from "@/lib/time";
 import { usePersistedViewState } from "@/lib/use-persisted-view-state";
-import type { AssistantMsg, TextBlock } from "@/lib/types";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -176,9 +179,13 @@ function DetailPane({ run, task, onRefresh }: DetailPaneProps) {
 	const [elapsedStr, setElapsedStr] = useState(() => elapsed(run.startedAt, run.completedAt));
 	const [retrying, setRetrying] = useState(false);
 	const [retryError, setRetryError] = useState<string | undefined>();
-	const msgsEndRef = useRef<HTMLDivElement>(null);
+	const [stopping, setStopping] = useState(false);
+	const [deleting, setDeleting] = useState(false);
+	const [actionError, setActionError] = useState<string | undefined>();
 
-	// Retain this live session only while its detail pane is mounted.
+	// Retain this live session only while its detail pane is mounted — used
+	// solely for the "Live"/"waiting" status hint below, never to re-render
+	// the transcript itself (that lives only in the shared `Chat` component).
 	useEffect(() => {
 		if (run.status !== "running") return;
 		return watchSession(run.sessionId);
@@ -193,27 +200,24 @@ function DetailPane({ run, task, onRefresh }: DetailPaneProps) {
 		return () => clearInterval(id);
 	}, [run.status, run.startedAt]);
 
-	// Auto-scroll messages
-	useEffect(() => {
-		msgsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-	}, [sessionData?.messages.length]);
+	const handleStop = useCallback(() => {
+		setStopping(true);
+		setActionError(undefined);
+		api.stopAutoWorkRun(run.id)
+			.then(() => onRefresh())
+			.catch((e: unknown) => setActionError(e instanceof Error ? e.message : String(e)))
+			.finally(() => setStopping(false));
+	}, [run.id, onRefresh]);
 
-	// Extract displayable text from the session message list
-	const textMessages = useMemo(() => {
-		if (!sessionData) return [];
-		return sessionData.messages
-			.filter((m): m is AssistantMsg => m.role === "assistant")
-			.map((m) => ({
-				id: m.id,
-				text: m.blocks
-					.filter((b): b is TextBlock => b.type === "text")
-					.map((b) => b.text)
-					.join(""),
-				isStreaming: m.isStreaming,
-			}))
-			.filter((m) => m.text.trim().length > 0)
-			.slice(-20); // last 20 text messages
-	}, [sessionData]);
+	const handleDelete = useCallback(() => {
+		if (!window.confirm("Delete this run? This permanently removes its history and cannot be undone.")) return;
+		setDeleting(true);
+		setActionError(undefined);
+		api.deleteAutoWorkRun(run.id)
+			.then(() => onRefresh())
+			.catch((e: unknown) => setActionError(e instanceof Error ? e.message : String(e)))
+			.finally(() => setDeleting(false));
+	}, [run.id, onRefresh]);
 
 	return (
 		<div className="flex h-full flex-col overflow-hidden">
@@ -228,8 +232,35 @@ function DetailPane({ run, task, onRefresh }: DetailPaneProps) {
 							{task?.title ?? run.taskId}
 						</p>
 					</div>
-					<StatusBadge status={run.status} />
+					<div className="flex shrink-0 items-center gap-2">
+						<StatusBadge status={run.status} />
+						{run.status === "running" ? (
+							<button
+								type="button"
+								disabled={stopping}
+								onClick={handleStop}
+								className="btn-danger h-7 gap-1 px-2 text-xs disabled:pointer-events-none disabled:opacity-40"
+								title="Stop this run"
+								aria-label="Stop run"
+							>
+								{stopping ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Square className="h-3 w-3" fill="currentColor" />}
+								Stop
+							</button>
+						) : (
+							<button
+								type="button"
+								disabled={deleting}
+								onClick={handleDelete}
+								className="rounded p-1.5 text-ink-3 transition-colors hover:bg-red-500/10 hover:text-red-400 disabled:pointer-events-none disabled:opacity-40"
+								title="Delete this run"
+								aria-label="Delete run"
+							>
+								{deleting ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+							</button>
+						)}
+					</div>
 				</div>
+				{actionError && <p className="mt-2 text-xs text-red-400">{actionError}</p>}
 			</div>
 
 			{/* Metrics grid */}
@@ -291,22 +322,6 @@ function DetailPane({ run, task, onRefresh }: DetailPaneProps) {
 				</div>
 			)}
 
-			{/* Session link */}
-			<div className="border-b border-line px-4 py-2.5">
-				<p className="text-xs text-ink-3">Session</p>
-				<div className="mt-1 flex items-center justify-between gap-2">
-					<span className="font-mono text-xs text-ink-3">{run.sessionId.slice(0, 8)}…</span>
-					<button
-						type="button"
-						onClick={() => navigate(`/c/${run.sessionId}`)}
-						className="inline-flex items-center gap-1.5 rounded bg-accent-soft/20 px-2.5 py-1 text-xs font-medium text-accent transition-colors hover:bg-accent-soft/40"
-					>
-						<ExternalLink className="h-3 w-3" />
-						Open in chat
-					</button>
-				</div>
-			</div>
-
 			{/* PR retry — shown when the run's PR creation failed (T-85 distinct
 			    status), or, for pre-T-85 historical rows, a completed run whose
 			    task body still carries the old inline failure note. */}
@@ -339,54 +354,34 @@ function DetailPane({ run, task, onRefresh }: DetailPaneProps) {
 				</div>
 			)}
 
-			{/* Live session transcript */}
-			<div className="flex min-h-0 flex-1 flex-col">
-				<div className="flex items-center gap-1.5 border-b border-line px-4 py-2">
-					<BotMessageSquare className="h-3.5 w-3.5 text-ink-3" />
-					<span className="text-xs font-medium text-ink-3">Session activity</span>
-					{run.status === "running" && sessionData?.status === "streaming" && (
-						<span className="ml-auto flex items-center gap-1 text-xs text-green-400">
+			{/* Session — the transcript itself is only ever rendered by the
+			    existing `Chat` component at `/c/:sessionId`; this pane just
+			    surfaces a live/waiting hint plus the link, avoiding a second
+			    message renderer (T-95). */}
+			<div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-4 py-6 text-center">
+				<BotMessageSquare className="h-8 w-8 text-ink-3 opacity-30" />
+				<span className="font-mono text-xs text-ink-3">{run.sessionId.slice(0, 8)}…</span>
+				{run.status === "running" && (
+					sessionData?.status === "streaming" ? (
+						<p className="flex items-center gap-1.5 text-xs text-green-400">
 							<span className="h-1.5 w-1.5 animate-pulse rounded-full bg-green-400" />
 							Live
-						</span>
-					)}
-				</div>
-
-				{run.status !== "running" && !sessionData ? (
-					<div className="flex flex-1 items-center justify-center text-xs text-ink-3">
-						<div className="text-center">
-							<CircleDashed className="mx-auto mb-2 h-8 w-8 opacity-30" />
-							<p>Session not loaded</p>
-							<button
-								type="button"
-								onClick={() => navigate(`/c/${run.sessionId}`)}
-								className="mt-2 inline-flex items-center gap-1 text-xs text-accent hover:underline"
-							>
-								<ArrowUpRight className="h-3 w-3" />
-								Open in chat to view
-							</button>
-						</div>
-					</div>
-				) : textMessages.length === 0 && run.status === "running" ? (
-					<div className="flex flex-1 items-center justify-center text-xs text-ink-3">
-						<div className="text-center">
-							<Activity className="mx-auto mb-2 h-6 w-6 animate-pulse opacity-50" />
-							<p>Waiting for agent response…</p>
-						</div>
-					</div>
-				) : (
-					<div className="flex-1 space-y-3 overflow-y-auto px-4 py-3">
-						{textMessages.map((m) => (
-							<div key={m.id} className="text-sm text-ink-2">
-								<p className={cn("whitespace-pre-wrap leading-relaxed", m.isStreaming && "after:inline-block after:h-3.5 after:w-0.5 after:animate-pulse after:bg-current after:align-middle after:content-['']")}>
-									{m.text.slice(0, 800)}
-									{m.text.length > 800 ? "…" : ""}
-								</p>
-							</div>
-						))}
-						<div ref={msgsEndRef} />
-					</div>
+						</p>
+					) : (
+						<p className="flex items-center gap-1.5 text-xs text-ink-3">
+							<Activity className="h-3 w-3 animate-pulse" />
+							Waiting for agent response…
+						</p>
+					)
 				)}
+				<button
+					type="button"
+					onClick={() => navigate(`/c/${run.sessionId}`)}
+					className="inline-flex items-center gap-1.5 rounded bg-accent-soft/20 px-3 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent-soft/40"
+				>
+					<ExternalLink className="h-3.5 w-3.5" />
+					Open in chat
+				</button>
 			</div>
 		</div>
 	);
@@ -409,6 +404,7 @@ export function AutoWorkView() {
 	// Global schedule state.
 	const [scheduleStatus, setScheduleStatus] = useState<AutoWorkScheduleStatus | null>(null);
 	const [triggering, setTriggering] = useState(false);
+	const refreshSequence = useRef(0);
 
 
 	const refreshScheduleStatus = useCallback(async (): Promise<void> => {
@@ -420,6 +416,7 @@ export function AutoWorkView() {
 
 
 	const refresh = useCallback(async (): Promise<void> => {
+		const sequence = ++refreshSequence.current;
 		try {
 			const [runsRes, tasksRes] = await Promise.all([
 				api.listAutoWorkRuns({ limit: 200 }),
@@ -430,16 +427,21 @@ export function AutoWorkView() {
 				if (a.status !== "running" && b.status === "running") return 1;
 				return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime();
 			});
+			if (sequence !== refreshSequence.current) return;
 			setAllRuns(sorted);
 			const map: Record<string, Task> = {};
 			for (const t of tasksRes.tasks) map[t.id] = t;
 			setTaskMap(map);
 			setError(undefined);
-			setSelectedRunId((prev) => prev ?? sorted[0]?.id);
+			// Fall back to the first run whenever the previously selected id no
+			// longer exists in the refreshed list (e.g. it was just deleted) —
+			// otherwise the detail pane goes blank instead of showing another run.
+			setSelectedRunId((prev) => (prev && sorted.some((r) => r.id === prev) ? prev : sorted[0]?.id));
 		} catch (e) {
+			if (sequence !== refreshSequence.current) return;
 			setError(String(e));
 		} finally {
-			setLoading(false);
+			if (sequence === refreshSequence.current) setLoading(false);
 		}
 	}, []);
 

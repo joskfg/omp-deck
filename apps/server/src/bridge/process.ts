@@ -15,12 +15,15 @@ import type {
 	SessionHistoryResponse,
 	SessionSnapshot,
 	SessionSummary,
+	SessionTreeResponse,
 } from "@omp-deck/protocol";
 
 import { broadcastBus } from "../broadcast-bus.ts";
+import { recordExtensionLoadErrors } from "../governance-service.ts";
 import { logger } from "../log.ts";
 import { resolveBunExecutable } from "../runtime-bun.ts";
 import { InProcessAgentBridge } from "./in-process.ts";
+import { forkSessionFile, readSessionTree } from "./session-tree.ts";
 import type { GoalAction } from "./goal-mode-bridge.ts";
 import type {
 	SerializedWorkerError,
@@ -153,6 +156,24 @@ export class ProcessAgentBridge implements AgentBridge {
 		const live = this.active.get(sessionId)?.handle;
 		if (live) await live.dispose();
 		return this.sessionlessBridge.deleteSession(sessionId);
+	}
+
+	/**
+	 * Reads directly off the live worker's `sessionFile` when the session is
+	 * active (never disposes it — this is a read, not a delete), otherwise
+	 * falls back to the sessionless bridge's persisted-listing resolution.
+	 */
+	getSessionTree(sessionId: string): Promise<SessionTreeResponse | undefined> {
+		const liveFile = this.active.get(sessionId)?.handle?.sessionFile;
+		if (liveFile) return readSessionTree(liveFile);
+		return this.sessionlessBridge.getSessionTree(sessionId);
+	}
+
+	/** Same live/persisted resolution as {@link getSessionTree}, never disposes the live handle. */
+	forkSessionAt(sessionId: string, entryId: string): Promise<{ sessionFile: string; cwd: string } | undefined> {
+		const liveFile = this.active.get(sessionId)?.handle?.sessionFile;
+		if (liveFile) return forkSessionFile(liveFile, entryId);
+		return this.sessionlessBridge.forkSessionAt(sessionId, entryId);
 	}
 
 	trackSubscriberAdded(sessionId: string, connectionId: string): void {
@@ -357,14 +378,40 @@ export class ProcessAgentBridge implements AgentBridge {
 		try {
 			const metadata = await this.request(record, method, args);
 			if (record.closed) throw new Error("agent worker exited during session initialization");
-			const handle = new ProcessSessionHandle(this, metadata);
-			record.sessionId = metadata.sessionId;
-			record.handle = handle;
 			const previous = this.active.get(metadata.sessionId);
-			if (previous) await this.disposeRecord(previous);
+			// T-32: an id collision where the existing record's worker has since
+			// auto-handed-off onto a DIFFERENT file (its `active` map key stays
+			// pinned to its pre-handoff id — same contract as the in-process
+			// bridge, see in-process.ts's `attach()` doc comments) is a
+			// legitimate, INDEPENDENT resume of that id's ORIGINAL file (e.g. the
+			// handoff banner's "origin" link), not a duplicate. Disposing it here
+			// would kill the user's still-live worker process. Give the new
+			// record its own identity instead; a genuine duplicate (same file)
+			// still supersedes exactly as before.
+			const previousFile = previous?.handle?.sessionFile;
+			const isDivergedHandoffOrigin =
+				previous !== undefined &&
+				previous.handle !== undefined &&
+				previousFile !== undefined &&
+				metadata.sessionFile !== undefined &&
+				path.resolve(previousFile) !== path.resolve(metadata.sessionFile);
+			const registrationId = isDivergedHandoffOrigin ? Bun.randomUUIDv7() : metadata.sessionId;
+			const handle = new ProcessSessionHandle(this, { ...metadata, sessionId: registrationId });
+			record.sessionId = registrationId;
+			record.handle = handle;
+			if (metadata.extensionErrors?.length) {
+				try {
+					recordExtensionLoadErrors(metadata.cwd, registrationId, metadata.extensionErrors);
+				} catch (err) {
+					log.warn(`failed to record extension load errors for session ${registrationId}`, err);
+				}
+			}
+			if (previous && !isDivergedHandoffOrigin) {
+				await this.disposeRecord(previous);
+			}
 			if (record.closed) throw new Error("agent worker exited while replacing the active session");
 			if (this.disposed) throw new Error("process agent bridge was disposed during session initialization");
-			this.active.set(metadata.sessionId, record);
+			this.active.set(registrationId, record);
 			return handle;
 		} catch (error) {
 			this.terminateProcess(record);
@@ -420,6 +467,16 @@ export class ProcessAgentBridge implements AgentBridge {
 			const eventType = (frame.event as { type?: string }).type;
 			if (eventType === "turn_start") record.turnInFlight = true;
 			else if (eventType === "turn_end" || eventType === "agent_end") record.turnInFlight = false;
+			// T-32: an auto-handoff swaps the worker's live session onto a new
+			// file+id in place (id/`active` map key deliberately stay pinned —
+			// same contract as the in-process bridge, see in-process.ts docs).
+			// Sync the tracked file BEFORE emitting so `resumeSession`'s
+			// live-file guard (above) can find this handle by its CURRENT file
+			// and any listener reacting to the event sees the fresh value.
+			if (eventType === "session_handoff") {
+				const newSessionFile = readStringField(frame.event, "newSessionFile");
+				if (newSessionFile) record.handle?.setSessionFile(newSessionFile);
+			}
 			record.handle?.emit(frame.event);
 			return;
 		}
@@ -428,31 +485,38 @@ export class ProcessAgentBridge implements AgentBridge {
 			return;
 		}
 		if (frame.channel === "ui") {
-			if (frame.frame.type === "ext_ui_dialog_open") {
-				record.pendingUiFrames.set(frame.frame.dialogId, frame.frame);
+			// T-32: the child worker's own uiBridge always tags frames with its
+			// NATURAL id — it has no visibility into this parent's disambiguated
+			// `registrationId` for a diverged-handoff-origin collision (see
+			// spawnSession). Rewrite so a client subscribed under the registered
+			// id (the only id it was ever given) actually receives it.
+			const uiFrame = rewriteFrameSessionId(frame.frame, record.sessionId);
+			if (uiFrame.type === "ext_ui_dialog_open") {
+				record.pendingUiFrames.set(uiFrame.dialogId, uiFrame);
 			} else {
-				record.pendingUiFrames.delete(frame.frame.dialogId);
+				record.pendingUiFrames.delete(uiFrame.dialogId);
 			}
-			for (const listener of record.uiListeners) invokeListener(listener, frame.frame, "UI");
+			for (const listener of record.uiListeners) invokeListener(listener, uiFrame, "UI");
 			return;
 		}
-		if (frame.frame.type === "plan_mode_changed") {
-			record.currentPlanModeFrame = frame.frame;
-			if (!frame.frame.enabled) record.pendingPlanFrame = undefined;
-		} else if (frame.frame.type === "plan_proposed") {
-			record.pendingPlanFrame = frame.frame;
-		} else if (frame.frame.type === "plan_execution_changed") {
-			if (frame.frame.status === "dispatched") {
-				if (record.pendingPlanExecutionFrame?.proposalId === frame.frame.proposalId) {
+		const planFrame = rewriteFrameSessionId(frame.frame, record.sessionId);
+		if (planFrame.type === "plan_mode_changed") {
+			record.currentPlanModeFrame = planFrame;
+			if (!planFrame.enabled) record.pendingPlanFrame = undefined;
+		} else if (planFrame.type === "plan_proposed") {
+			record.pendingPlanFrame = planFrame;
+		} else if (planFrame.type === "plan_execution_changed") {
+			if (planFrame.status === "dispatched") {
+				if (record.pendingPlanExecutionFrame?.proposalId === planFrame.proposalId) {
 					record.pendingPlanExecutionFrame = undefined;
 				}
 			} else {
-				record.pendingPlanExecutionFrame = frame.frame;
+				record.pendingPlanExecutionFrame = planFrame;
 			}
-		} else if (record.pendingPlanFrame?.proposalId === frame.frame.proposalId) {
+		} else if (record.pendingPlanFrame?.proposalId === planFrame.proposalId) {
 			record.pendingPlanFrame = undefined;
 		}
-		for (const listener of record.planListeners) invokeListener(listener, frame.frame, "plan-mode");
+		for (const listener of record.planListeners) invokeListener(listener, planFrame, "plan-mode");
 	}
 
 	private onWorkerExit(record: ActiveProcess, reason: string): void {
@@ -527,8 +591,8 @@ export class ProcessAgentBridge implements AgentBridge {
 
 export class ProcessSessionHandle implements SessionHandle {
 	readonly sessionId: string;
-	readonly sessionFile: string | undefined;
 	readonly cwd: string;
+	private currentSessionFile: string | undefined;
 	private readonly listeners = new Set<EventListener>();
 	private disposed = false;
 	private disposePromise: Promise<void> | undefined;
@@ -538,8 +602,18 @@ export class ProcessSessionHandle implements SessionHandle {
 		metadata: WorkerSessionMetadata,
 	) {
 		this.sessionId = metadata.sessionId;
-		this.sessionFile = metadata.sessionFile;
+		this.currentSessionFile = metadata.sessionFile;
 		this.cwd = metadata.cwd;
+	}
+
+	get sessionFile(): string | undefined {
+		return this.currentSessionFile;
+	}
+
+	/** T-32: called by the bridge when a `session_handoff` event reports this
+	 *  session's live file changed underneath it (see `onWorkerMessage`). */
+	setSessionFile(sessionFile: string): void {
+		this.currentSessionFile = sessionFile;
 	}
 
 	subscribe(listener: EventListener): () => void {
@@ -617,6 +691,10 @@ export class ProcessSessionHandle implements SessionHandle {
 		return this.call("session.setModel", [ref]);
 	}
 
+	setThinkingLevel(level: string): Promise<void> {
+		return this.call("session.setThinkingLevel", [level]);
+	}
+
 	dispatchSlashCommand(text: string): Promise<SlashDispatchResult> {
 		return this.call("session.dispatchSlashCommand", [text]);
 	}
@@ -676,6 +754,21 @@ export class ProcessSessionHandle implements SessionHandle {
 		if (this.disposed) return Promise.reject(new Error(`session is disposed: ${this.sessionId}`));
 		return this.bridge.requestSession(this.sessionId, method, args);
 	}
+}
+
+/** T-32: rewrites a `{ sessionId }`-carrying frame to the given id, only
+ *  allocating a new object when the id actually differs — see
+ *  `onWorkerMessage`'s ui/plan-frame doc comment for why this is needed. */
+function rewriteFrameSessionId<T extends { sessionId: string }>(frame: T, sessionId: string | undefined): T {
+	if (!sessionId || frame.sessionId === sessionId) return frame;
+	return { ...frame, sessionId };
+}
+
+function readStringField(value: unknown, key: string): string | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	if (!(key in value)) return undefined;
+	const v = (value as Record<string, unknown>)[key];
+	return typeof v === "string" ? v : undefined;
 }
 
 function invokeListener<T>(listener: (value: T) => void, value: T, channel: string): void {

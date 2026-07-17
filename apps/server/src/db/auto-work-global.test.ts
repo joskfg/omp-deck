@@ -93,6 +93,7 @@ describe("global auto-work config", () => {
 			scheduleIntervalMinutes: 15,
 			taskSelectionModel: { provider: "anthropic", id: "claude-selector" },
 			squeezeEnabled: true,
+			modelByDifficulty: { easy: null, medium: null, hard: null },
 		};
 		const initialSaved = setAutoWorkGlobalConfig(initial);
 		expect(initialSaved).toMatchObject(initial);
@@ -103,6 +104,11 @@ describe("global auto-work config", () => {
 			scheduleIntervalMinutes: 60,
 			taskSelectionModel: null,
 			squeezeEnabled: false,
+			modelByDifficulty: {
+				easy: { provider: "anthropic", id: "claude-easy" },
+				medium: null,
+				hard: { provider: "openai", id: "gpt-hard" },
+			},
 		};
 		const replacementSaved = setAutoWorkGlobalConfig(replacement);
 		expect(replacementSaved).toMatchObject(replacement);

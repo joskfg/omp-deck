@@ -32,10 +32,11 @@ export interface GlobalScheduleState {
 
 interface InternalState extends GlobalScheduleState {
 	timer: NodeJS.Timeout | null;
+	cycleInFlight: boolean;
 }
 
 // Single instance — the scheduler is a process singleton.
-const state: InternalState = { timer: null, lastTriggeredAt: null, lastOutcome: null };
+const state: InternalState = { timer: null, cycleInFlight: false, lastTriggeredAt: null, lastOutcome: null };
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -139,6 +140,12 @@ export function updateGlobalSchedule(
 	const intervalMs = Math.max(1, config.scheduleIntervalMinutes) * 60_000;
 	log.info(`global schedule: every ${config.scheduleIntervalMinutes} min`);
 	const tick = (): void => {
+		if (state.cycleInFlight) {
+			log.warn(`scheduled global cycle skipped because the previous cycle is still in flight`);
+			return;
+		}
+
+		state.cycleInFlight = true;
 		state.lastTriggeredAt = new Date().toISOString();
 		// Advance any auto-merge runs whose PR merged since the last tick
 		// (fully-autonomous mode). Best-effort — never blocks the cycle below.
@@ -146,6 +153,9 @@ export function updateGlobalSchedule(
 		runGlobalAutoWorkCycle(bridge, { ...cycleOptions, taskSelectionModel: config.taskSelectionModel })
 			.then(async (outcome) => {
 				state.lastOutcome = outcome;
+				log.info(
+					`scheduled cycle finished: ${outcome.outcome}${outcome.outcome === "skipped" ? ` — ${outcome.reason}` : ""}`,
+				);
 				await runSqueezeFollowUps(config, bridge, cycleOptions);
 			})
 			.catch((err: unknown) => {
@@ -153,6 +163,7 @@ export function updateGlobalSchedule(
 				state.lastOutcome = { outcome: "skipped", reason: String(err) };
 			})
 			.finally(() => {
+				state.cycleInFlight = false;
 				broadcastBus.broadcast({ type: "auto_work_runs_changed" });
 			});
 	};

@@ -10,6 +10,8 @@ export interface Config {
 	agentDir?: string;
 	webDist?: string;
 	devMode: boolean;
+	/** Visible application title exposed to the web client. */
+	title: string;
 	/** Ms a session may sit without WS subscribers before the reaper disposes it. 0 disables. */
 	idleTimeoutMs: number;
 	/** Absolute path to the sqlite database file. */
@@ -66,6 +68,7 @@ export function loadConfig(): Config {
 		extraWorkspaces: extra.map((p) => path.resolve(p)),
 		agentDir,
 		webDist,
+		title: process.env.OMP_DECK_TITLE?.trim() || "omp-deck",
 		devMode: process.env.NODE_ENV !== "production",
 		// 5 minutes default. Set to 0 to disable reaping (kernels live until SIGINT).
 		idleTimeoutMs: parseInt10(process.env.OMP_DECK_IDLE_TIMEOUT_MS, 5 * 60_000),

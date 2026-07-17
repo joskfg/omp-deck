@@ -21,7 +21,7 @@ import { KbService } from "./kb-service.ts";
 import { buildRouter } from "./routes.ts";
 import type { AgentBridge, CreateSessionOpts, SessionHandle } from "./bridge/types.ts";
 import { broadcastBus, type BroadcastFrame } from "./broadcast-bus.ts";
-import type { ModelInfo, SessionSummary } from "@omp-deck/protocol"
+import type { ModelInfo, SessionSnapshot, SessionSummary } from "@omp-deck/protocol"
 
 let dbDir: string | null = null;
 let createCalls: CreateSessionOpts[] = [];
@@ -76,6 +76,7 @@ function fakeConfig(defaultCwd: string): Config {
 		defaultCwd,
 		extraWorkspaces: [],
 		devMode: true,
+		title: "omp-deck",
 		idleTimeoutMs: 0,
 		dbPath: ":memory:",
 		uploadsRoot: path.join(os.tmpdir(), "omp-deck-uploads-test"),
@@ -108,6 +109,46 @@ const UNAUTHED_MODEL: ModelInfo = {
 	label: "Claude No Auth",
 	isAvailable: false,
 };
+interface ThinkingTestOptions {
+	models: ModelInfo[];
+	streaming?: boolean;
+	planModeOverride?: boolean;
+}
+
+function buildThinkingTestHarness(options: ThinkingTestOptions) {
+	const thinkingCalls: string[] = [];
+	const activeModel = options.models[0] ?? AVAILABLE_MODEL;
+	const handle = {
+		async snapshot() {
+			return {
+				model: { provider: activeModel.provider, id: activeModel.id },
+				...(options.planModeOverride
+					? {
+							planMode: {
+								modelOverride: {
+									model: { provider: "anthropic", id: "claude-plan" },
+									pending: false,
+								},
+							},
+						}
+					: {}),
+			} as unknown as SessionSnapshot;
+		},
+		async isStreamingNow() {
+			return options.streaming ?? false;
+		},
+		async setThinkingLevel(level: string) {
+			thinkingCalls.push(level);
+		},
+	} as unknown as SessionHandle;
+	const bridge: AgentBridge = {
+		...fakeBridge(options.models),
+		getSession(id: string) {
+			return id === "sess-1" ? handle : undefined;
+		},
+	};
+	return { app: buildTestApp(bridge, process.cwd()), thinkingCalls };
+}
 
 beforeEach(() => {
 	dbDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-deck-routes-sessions-db-"));
@@ -270,6 +311,176 @@ describe("PUT /workspace-preferences — T-42", () => {
 		};
 		const entry = workspaces.find((w) => w.cwd === cwd);
 		expect(entry?.defaultModel).toEqual({ provider: "anthropic", id: "claude-good" });
+	});
+});
+
+describe("PATCH /sessions/:id — T-93 thinking", () => {
+	test("applies off and an active model's advertised thinking level, broadcasting each change", async () => {
+		const thinkingModel: ModelInfo = {
+			...AVAILABLE_MODEL,
+			thinkingLevels: ["low"],
+		};
+		const { app, thinkingCalls } = buildThinkingTestHarness({ models: [thinkingModel] });
+		const frames: BroadcastFrame[] = [];
+		const unsub = broadcastBus.subscribe((frame) => frames.push(frame));
+		try {
+			const off = await app.request("/sessions/sess-1", {
+				method: "PATCH",
+				body: JSON.stringify({ thinking: "off" }),
+			});
+			const low = await app.request("/sessions/sess-1", {
+				method: "PATCH",
+				body: JSON.stringify({ thinking: "low" }),
+			});
+
+			expect(off.status).toBe(200);
+			expect(low.status).toBe(200);
+			expect(thinkingCalls).toEqual(["off", "low"]);
+			expect(frames.filter((frame) => frame.type === "sessions_changed")).toHaveLength(2);
+		} finally {
+			unsub();
+		}
+	});
+
+	test("rejects a combined model and thinking patch before either setter or broadcast", async () => {
+		const modelCalls: Array<{ provider: string; id: string }> = [];
+		const thinkingCalls: string[] = [];
+		const handle = {
+			async setModel(model: { provider: string; id: string }) {
+				modelCalls.push(model);
+			},
+			async setThinkingLevel(level: string) {
+				thinkingCalls.push(level);
+			},
+		} as unknown as SessionHandle;
+		const bridge: AgentBridge = {
+			...fakeBridge([AVAILABLE_MODEL]),
+			getSession(id: string) {
+				return id === "sess-1" ? handle : undefined;
+			},
+		};
+		const app = buildTestApp(bridge, process.cwd());
+		const frames: BroadcastFrame[] = [];
+		const unsub = broadcastBus.subscribe((frame) => frames.push(frame));
+		try {
+			const res = await app.request("/sessions/sess-1", {
+				method: "PATCH",
+				body: JSON.stringify({
+					model: { provider: "anthropic", id: "claude-good" },
+					thinking: "low",
+				}),
+			});
+
+			expect(res.status).toBe(400);
+			expect(modelCalls).toEqual([]);
+			expect(thinkingCalls).toEqual([]);
+			expect(frames.some((frame) => frame.type === "sessions_changed")).toBe(false);
+		} finally {
+			unsub();
+		}
+	});
+
+	test("rejects non-string and blank thinking input without mutation or broadcast", async () => {
+		const thinkingModel: ModelInfo = {
+			...AVAILABLE_MODEL,
+			thinkingLevels: ["low"],
+		};
+		const { app, thinkingCalls } = buildThinkingTestHarness({ models: [thinkingModel] });
+		const frames: BroadcastFrame[] = [];
+		const unsub = broadcastBus.subscribe((frame) => frames.push(frame));
+		try {
+			for (const thinking of ["", "   ", 1, null]) {
+				const res = await app.request("/sessions/sess-1", {
+					method: "PATCH",
+					body: JSON.stringify({ thinking }),
+				});
+				expect(res.status).toBe(400);
+			}
+			expect(thinkingCalls).toEqual([]);
+			expect(frames.some((frame) => frame.type === "sessions_changed")).toBe(false);
+		} finally {
+			unsub();
+		}
+	});
+
+	test("rejects thinking when the active model does not advertise capability without mutation or broadcast", async () => {
+		const { app, thinkingCalls } = buildThinkingTestHarness({ models: [AVAILABLE_MODEL] });
+		const frames: BroadcastFrame[] = [];
+		const unsub = broadcastBus.subscribe((frame) => frames.push(frame));
+		try {
+			const res = await app.request("/sessions/sess-1", {
+				method: "PATCH",
+				body: JSON.stringify({ thinking: "low" }),
+			});
+			expect(res.status).toBe(400);
+			expect(thinkingCalls).toEqual([]);
+			expect(frames.some((frame) => frame.type === "sessions_changed")).toBe(false);
+		} finally {
+			unsub();
+		}
+	});
+
+	test("rejects a level absent from the active model without mutation or broadcast", async () => {
+		const thinkingModel: ModelInfo = {
+			...AVAILABLE_MODEL,
+			thinkingLevels: ["low"],
+		};
+		const { app, thinkingCalls } = buildThinkingTestHarness({ models: [thinkingModel] });
+		const frames: BroadcastFrame[] = [];
+		const unsub = broadcastBus.subscribe((frame) => frames.push(frame));
+		try {
+			const res = await app.request("/sessions/sess-1", {
+				method: "PATCH",
+				body: JSON.stringify({ thinking: "high" }),
+			});
+			expect(res.status).toBe(400);
+			expect(thinkingCalls).toEqual([]);
+			expect(frames.some((frame) => frame.type === "sessions_changed")).toBe(false);
+		} finally {
+			unsub();
+		}
+	});
+
+	test("rejects thinking changes during streaming without mutation or broadcast", async () => {
+		const thinkingModel: ModelInfo = {
+			...AVAILABLE_MODEL,
+			thinkingLevels: ["low"],
+		};
+		const { app, thinkingCalls } = buildThinkingTestHarness({ models: [thinkingModel], streaming: true });
+		const frames: BroadcastFrame[] = [];
+		const unsub = broadcastBus.subscribe((frame) => frames.push(frame));
+		try {
+			const res = await app.request("/sessions/sess-1", {
+				method: "PATCH",
+				body: JSON.stringify({ thinking: "low" }),
+			});
+			expect(res.status).toBe(409);
+			expect(thinkingCalls).toEqual([]);
+			expect(frames.some((frame) => frame.type === "sessions_changed")).toBe(false);
+		} finally {
+			unsub();
+		}
+	});
+
+	test("rejects thinking changes while Plan Mode overrides the model without mutation or broadcast", async () => {
+		const thinkingModel: ModelInfo = {
+			...AVAILABLE_MODEL,
+			thinkingLevels: ["low"],
+		};
+		const { app, thinkingCalls } = buildThinkingTestHarness({ models: [thinkingModel], planModeOverride: true });
+		const frames: BroadcastFrame[] = [];
+		const unsub = broadcastBus.subscribe((frame) => frames.push(frame));
+		try {
+			const res = await app.request("/sessions/sess-1", {
+				method: "PATCH",
+				body: JSON.stringify({ thinking: "low" }),
+			});
+			expect(res.status).toBe(409);
+			expect(thinkingCalls).toEqual([]);
+			expect(frames.some((frame) => frame.type === "sessions_changed")).toBe(false);
+		} finally {
+			unsub();
+		}
 	});
 });
 

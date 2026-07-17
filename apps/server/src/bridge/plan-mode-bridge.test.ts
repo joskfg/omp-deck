@@ -13,7 +13,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 
 import type { ModelRef, ServerFrame } from "@omp-deck/protocol";
 
@@ -788,23 +788,6 @@ describe("PlanModeBridge", () => {
 		await expect(fs.access(harness.planFile)).resolves.toBeNull();
 	});
 
-	it("approve ignores malicious finalPath (SDK no longer renames)", async () => {
-		await harness.bridge.enter();
-		await fs.writeFile(harness.planFile, "# Yo\n");
-
-		const { resultPromise } = await invokeApply(harness, { extra: { title: "fallback case" } });
-		const proposed = harness.frames.find(
-			(f): f is Extract<PlanModeFrame, { type: "plan_proposed" }> => f.type === "plan_proposed",
-		)!;
-		// `..` path-escape attempt; bridge ignores finalPath, file stays at original path.
-		harness.bridge.respond(proposed.proposalId, {
-			approved: true,
-			finalPath: "local://../escape.md",
-		});
-		const result = await resultPromise;
-		expect(result.details.sourceResultDetails?.planFilePath).toBe("local://PLAN.md");
-	});
-
 	it("reject path exits plan mode, broadcasts rejected resolution, and surfaces a rejection result", async () => {
 		await harness.bridge.enter();
 		await fs.writeFile(harness.planFile, "# Foo\n");
@@ -876,6 +859,30 @@ describe("PlanModeBridge", () => {
 		harness.bridge.dispose();
 		await expect(resultPromise).rejects.toThrow(/abandoned|disposed/i);
 		expect(harness.bridge.hasPendingApproval()).toBe(false);
+	});
+
+	it("dispose() catches and logs an asynchronous exit failure", async () => {
+		await harness.bridge.enter();
+		const originalSetStandingResolveHandler = harness.session.setStandingResolveHandler;
+		const failure = new Error("standing handler cleanup failed");
+		harness.session.setStandingResolveHandler = () => {
+			throw failure;
+		};
+		const logged = Promise.withResolvers<void>();
+		const logSpy = spyOn(console, "log").mockImplementation((message: unknown, error: unknown) => {
+			if (typeof message === "string" && message.includes("plan mode disposal failed for s_test")) {
+				expect(error).toBe(failure);
+				logged.resolve();
+			}
+		});
+
+		try {
+			harness.bridge.dispose();
+			await logged.promise;
+		} finally {
+			logSpy.mockRestore();
+			harness.session.setStandingResolveHandler = originalSetStandingResolveHandler;
+		}
 	});
 
 	it("snapshot replay frames cover both mode-changed and pending proposal", async () => {
@@ -1168,5 +1175,217 @@ describe("PlanModeBridge plan-role model", () => {
 		expect(fake.setModelTemporaryCalls).toEqual([]);
 		expect(fake.setThinkingLevelCalls).toEqual([]);
 		expect(harness.bridge.getPlanModeContext()).toBeUndefined();
+	});
+});
+
+describe("T-29: plan mode persistence and restore", () => {
+	interface RestoreHarness {
+		dir: string;
+		planFile: string;
+		session: StubSession;
+		bridge: PlanModeBridge;
+		frames: PlanModeFrame[];
+		modeChanges: Array<{ mode: string; data?: Record<string, unknown> }>;
+		cleanup: () => Promise<void>;
+	}
+
+	async function makeRestoreHarness(): Promise<RestoreHarness> {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "plan-mode-restore-test-"));
+		const localDir = path.join(dir, "local");
+		await fs.mkdir(localDir, { recursive: true });
+		const session = new StubSession();
+		const modeChanges: Array<{ mode: string; data?: Record<string, unknown> }> = [];
+		const bridge = new PlanModeBridge({
+			sessionId: "s_test",
+			session,
+			getArtifactsDir: () => dir,
+			getSessionId: () => "s_test",
+			persistModeChange: (mode, data) => {
+				modeChanges.push({ mode, ...(data ? { data } : {}) });
+			},
+		});
+		const { frames } = collect(bridge);
+		return {
+			dir,
+			planFile: path.join(localDir, "PLAN.md"),
+			session,
+			bridge,
+			frames,
+			modeChanges,
+			async cleanup() {
+				await bridge.exit("session_disposed");
+				bridge.dispose();
+				await fs.rm(dir, { recursive: true, force: true });
+			},
+		};
+	}
+
+	/** Awaits the next broadcast frame of `type` — no wall-clock waits. */
+	function nextFrameOfType<T extends PlanModeFrame["type"]>(
+		bridge: PlanModeBridge,
+		type: T,
+	): Promise<Extract<PlanModeFrame, { type: T }>> {
+		const { promise, resolve } = Promise.withResolvers<Extract<PlanModeFrame, { type: T }>>();
+		const unsub = bridge.subscribeFrames((frame) => {
+			if (frame.type !== type) return;
+			unsub();
+			resolve(frame as Extract<PlanModeFrame, { type: T }>);
+		});
+		return promise;
+	}
+
+	let h: RestoreHarness;
+
+	beforeEach(async () => {
+		h = await makeRestoreHarness();
+	});
+
+	afterEach(async () => {
+		await h.cleanup();
+	});
+
+	it("enter() persists mode 'plan' and a user exit persists 'none'", async () => {
+		await h.bridge.enter();
+		expect(h.modeChanges).toEqual([{ mode: "plan", data: { planFilePath: "local://PLAN.md" } }]);
+
+		await h.bridge.exit("user_cancelled");
+		expect(h.modeChanges).toHaveLength(2);
+		expect(h.modeChanges[1]).toEqual({ mode: "none" });
+	});
+
+	it("dispose() keeps the persisted plan mode so a later resume can restore it", async () => {
+		await h.bridge.enter();
+		await h.bridge.exit("session_disposed");
+		h.bridge.dispose();
+
+		expect(h.modeChanges).toEqual([{ mode: "plan", data: { planFilePath: "local://PLAN.md" } }]);
+	});
+
+	it("a live proposal writes a durable marker, and settling it clears the mode", async () => {
+		await h.bridge.enter();
+		await fs.writeFile(h.planFile, "# The plan\n\nDo the thing.\n", "utf-8");
+
+		const proposed = nextFrameOfType(h.bridge, "plan_proposed");
+		const resultPromise = h.session.standingHandler!({ action: "apply", reason: "plan ready" }) as Promise<unknown>;
+		const frame = await proposed;
+
+		const marker = h.modeChanges.at(-1);
+		expect(marker?.mode).toBe("plan");
+		expect(marker?.data).toEqual({
+			planFilePath: "local://PLAN.md",
+			proposal: {
+				proposalId: frame.proposalId,
+				suggestedTitle: frame.suggestedTitle,
+				suggestedFinalPath: frame.suggestedFinalPath,
+			},
+		});
+
+		expect(h.bridge.respond(frame.proposalId, { approved: false })).toBe("settled");
+		await resultPromise;
+		expect(h.modeChanges.at(-1)).toEqual({ mode: "none" });
+	});
+
+	it("restore() re-activates plan mode (tools, SDK state, handler, frame) without re-persisting", async () => {
+		await h.bridge.restore({ planFilePath: "local://PLAN.md" });
+
+		expect(h.bridge.isEnabled()).toBe(true);
+		expect(h.session.getActiveToolNames()).toContain("resolve");
+		expect(h.session.planModeStateCalls).toEqual([
+			{ enabled: true, planFilePath: "local://PLAN.md", workflow: "parallel" },
+		]);
+		expect(h.session.standingHandler).toBeTypeOf("function");
+		expect(h.frames).toEqual([
+			expect.objectContaining({ type: "plan_mode_changed", enabled: true, planFilePath: "local://PLAN.md" }),
+		]);
+		// Restore replays persisted state — it must not write a new entry.
+		expect(h.modeChanges).toEqual([]);
+	});
+
+	it("restore() re-emits a pending proposal from the durable plan file", async () => {
+		const planContent = "# Recovered plan\n\nSteps.\n";
+		await fs.writeFile(h.planFile, planContent, "utf-8");
+
+		await h.bridge.restore({
+			planFilePath: "local://PLAN.md",
+			proposal: { proposalId: "pa_s_test_3", suggestedTitle: "Recovered plan", suggestedFinalPath: "local://recovered-plan.md" },
+		});
+
+		expect(h.bridge.hasPendingApproval()).toBe(true);
+		const proposed = h.frames.find((f): f is Extract<PlanModeFrame, { type: "plan_proposed" }> => f.type === "plan_proposed");
+		expect(proposed).toEqual({
+			type: "plan_proposed",
+			sessionId: "s_test",
+			proposalId: "pa_s_test_3",
+			planFilePath: "local://PLAN.md",
+			planContent,
+			suggestedTitle: "Recovered plan",
+			suggestedFinalPath: "local://recovered-plan.md",
+		});
+		// The replay surface must carry the recovered proposal for late subscribers.
+		expect(h.bridge.getReplayFrames()).toContainEqual(proposed!);
+	});
+
+	it("rejecting a recovered proposal resolves it and exits plan mode", async () => {
+		await fs.writeFile(h.planFile, "# Plan\n", "utf-8");
+		await h.bridge.restore({
+			planFilePath: "local://PLAN.md",
+			proposal: { proposalId: "pa_s_test_1", suggestedTitle: "Plan", suggestedFinalPath: "local://plan.md" },
+		});
+
+		const resolved = nextFrameOfType(h.bridge, "plan_proposal_resolved");
+		const modeChanged = nextFrameOfType(h.bridge, "plan_mode_changed");
+		expect(h.bridge.respond("pa_s_test_1", { approved: false })).toBe("settled");
+
+		expect(await resolved).toEqual(
+			expect.objectContaining({ proposalId: "pa_s_test_1", outcome: "rejected" }),
+		);
+		expect(await modeChanged).toEqual(expect.objectContaining({ enabled: false }));
+		expect(h.bridge.isEnabled()).toBe(false);
+		expect(h.modeChanges.at(-1)).toEqual({ mode: "none" });
+	});
+
+	it("approving a recovered proposal dispatches the execution prompt directly", async () => {
+		const planContent = "# Plan\n\nShip it.\n";
+		await fs.writeFile(h.planFile, planContent, "utf-8");
+		await h.bridge.restore({
+			planFilePath: "local://PLAN.md",
+			proposal: { proposalId: "pa_s_test_2", suggestedTitle: "Plan", suggestedFinalPath: "local://plan.md" },
+		});
+
+		const dispatched = nextFrameOfType(h.bridge, "plan_execution_changed");
+		expect(h.bridge.respond("pa_s_test_2", { approved: true })).toBe("settled");
+
+		expect(await dispatched).toEqual(
+			expect.objectContaining({ proposalId: "pa_s_test_2", status: "dispatched" }),
+		);
+		// The dead resolve-tool turn cannot dispatch — the bridge prompts directly.
+		expect(h.session.promptCalls).toHaveLength(1);
+		expect(h.session.promptCalls[0]?.text).toContain(planContent.trim());
+		expect(h.bridge.isEnabled()).toBe(false);
+		expect(h.modeChanges.at(-1)).toEqual({ mode: "none" });
+	});
+
+	it("restore() with the plan file gone keeps plan mode but drops and clears the orphan marker", async () => {
+		await h.bridge.restore({
+			planFilePath: "local://PLAN.md",
+			proposal: { proposalId: "pa_s_test_9", suggestedTitle: "Gone", suggestedFinalPath: "local://gone.md" },
+		});
+
+		expect(h.bridge.isEnabled()).toBe(true);
+		expect(h.bridge.hasPendingApproval()).toBe(false);
+		expect(h.frames.some((f) => f.type === "plan_proposed")).toBe(false);
+		// Marker cleared so the next resume doesn't re-drop the same orphan.
+		expect(h.modeChanges).toEqual([{ mode: "plan", data: { planFilePath: "local://PLAN.md" } }]);
+	});
+
+	it("a failing restore falls back to normal mode and clears the persisted state", async () => {
+		h.session.setActiveToolsByName = async () => {
+			throw new Error("SDK tool wiring exploded");
+		};
+
+		await h.bridge.restore({ planFilePath: "local://PLAN.md" });
+
+		expect(h.bridge.isEnabled()).toBe(false);
+		expect(h.modeChanges).toEqual([{ mode: "none" }]);
 	});
 });

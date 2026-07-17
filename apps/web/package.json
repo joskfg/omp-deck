@@ -8,7 +8,9 @@
 		"build": "tsc -b && vite build",
 		"build:debug": "tsc -b && OMP_DECK_NO_MINIFY=1 vite build",
 		"preview": "vite preview",
-		"typecheck": "tsc -b --noEmit"
+		"typecheck": "tsc -b --noEmit",
+		"test": "bun test",
+		"test:e2e:codebase-memory": "bun run build && bun e2e/codebase-memory-graph.e2e.ts"
 	},
 	"dependencies": {
 		"@dnd-kit/core": "^6.3.1",
@@ -37,6 +39,7 @@
 		"@types/react": "^19.2.17",
 		"@types/react-dom": "^19.2.3",
 		"@vitejs/plugin-react": "^6.0.3",
+		"puppeteer-core": "^25.3.0",
 		"tailwindcss": "^4.3.2",
 		"typescript": "^6.0.3",
 		"vite": "^8.1.3"

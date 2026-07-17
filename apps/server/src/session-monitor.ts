@@ -129,6 +129,15 @@ function countToolCallBlocks(content: unknown): number {
 
 function findTerminalError(records: TranscriptRecord[]): string | undefined {
 	for (const record of [...records].reverse()) {
+		// A later successful terminal event proves preceding notice/tool errors
+		// were handled by the agent. In particular, TTSR intentionally aborts
+		// and retries a stream after injecting its matched rules.
+		if (
+			(record.type === "agent_end" || record.type === "turn_end") &&
+			(record.stopReason === "end_turn" || record.stopReason === "stop")
+		) {
+			return undefined;
+		}
 		if (record.type === "agent_end" && record.stopReason === "error") return "Agent turn ended with an error.";
 		if (record.type === "notice" && record.level === "error") return textFromUnknown(record.message ?? record.data) || "Session reported an error.";
 		if (record.isError) return textFromUnknown(record.message ?? record.data) || "A recent session step failed.";

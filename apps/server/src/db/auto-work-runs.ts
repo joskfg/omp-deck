@@ -114,6 +114,12 @@ export function getAutoWorkRun(runId: string): AutoWorkRun | undefined {
 	return row ? rowToRun(row) : undefined;
 }
 
+/** Delete a run row. Returns whether a row was actually removed. */
+export function deleteAutoWorkRun(runId: string): boolean {
+	const r = getDb().prepare<unknown, [string]>("DELETE FROM auto_work_runs WHERE id = ?").run(runId);
+	return Number(r.changes ?? 0) > 0;
+}
+
 /** List runs, most recent first, with optional filters. */
 export function listAutoWorkRuns(filter: {
 	limit?: number;
@@ -151,6 +157,28 @@ export function listAutoWorkRuns(filter: {
 		)
 		.all(...params) as RunRow[];
 	return rows.map(rowToRun);
+}
+
+/**
+ * Consecutive failed/timed-out runs for `taskId` since its last successful
+ * run (`completed` / `completed_pr_failed`); a success resets the streak.
+ * Drives the auto-retry budget (T-100): the engine stops re-running a task
+ * once this reaches `MAX_AUTO_WORK_TASK_ATTEMPTS`.
+ */
+export function countConsecutiveAutoWorkFailures(taskId: string): number {
+	const row = getDb()
+		.query<{ n: number }, [string, string]>(
+			`SELECT COUNT(*) AS n
+			 FROM auto_work_runs
+			 WHERE task_id = ?
+			   AND status IN ('failed', 'timed_out')
+			   AND started_at > COALESCE((
+			     SELECT MAX(started_at) FROM auto_work_runs
+			     WHERE task_id = ? AND status IN ('completed', 'completed_pr_failed')
+			   ), '')`,
+		)
+		.get(taskId, taskId);
+	return row?.n ?? 0;
 }
 
 /**

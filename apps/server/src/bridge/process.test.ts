@@ -22,6 +22,7 @@ class FakeAgentWorker implements AgentWorkerProcess {
 
 	private readonly onMessage: (message: unknown) => void;
 	private readonly queued: QueuedPromptWire[] = [];
+	readonly receivedRequests: WorkerRequestFrame[] = [];
 	private readonly heldRequestCounts = new Map<WorkerMethod, number>();
 	private readonly heldRequests: WorkerRequestFrame[] = [];
 	private resolveExit!: (code: number) => void;
@@ -37,6 +38,7 @@ class FakeAgentWorker implements AgentWorkerProcess {
 	}
 
 	send(message: WorkerRequestFrame): void {
+		this.receivedRequests.push(message);
 		if (this.closed) throw new Error(`worker ${this.sessionId} is closed`);
 		const heldCount = this.heldRequestCounts.get(message.method) ?? 0;
 		if (heldCount > 0) {
@@ -196,6 +198,20 @@ describe("ProcessAgentBridge worker isolation", () => {
 				queuedAt: 1,
 			},
 		]);
+	});
+
+	test("forwards thinking level changes through the owning worker RPC", async () => {
+		const harness = createHarness();
+		const handle = await harness.bridge.createSession({ cwd: "/same-workspace" });
+		const worker = harness.workers[0]!;
+		worker.holdNext("session.setThinkingLevel");
+
+		const change = handle.setThinkingLevel("low");
+		expect(worker.receivedRequests).toContainEqual(
+			expect.objectContaining({ method: "session.setThinkingLevel", args: ["low"] }),
+		);
+		worker.releaseHeldInReverse("session.setThinkingLevel", [undefined]);
+		await expect(change).resolves.toBeUndefined();
 	});
 
 	test("out-of-order worker responses stay correlated with their originating calls", async () => {

@@ -3,6 +3,7 @@ import type {
 	KbFileResponse,
 	KbGraphResponse,
 	KbSearchResponse,
+	KbTreeEntry,
 	KbTreeResponse,
 } from "@omp-deck/protocol";
 
@@ -47,6 +48,9 @@ export const kbApi = {
 			method: "POST",
 			body: JSON.stringify({ content }),
 		});
+	},
+	createFolder(path: string): Promise<KbTreeEntry> {
+		return req<KbTreeEntry>(`/kb/folder${qs({ path })}`, { method: "POST" });
 	},
 	graph(): Promise<KbGraphResponse> {
 		return req<KbGraphResponse>("/kb/graph");

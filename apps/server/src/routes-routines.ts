@@ -179,7 +179,11 @@ export function buildRoutinesRouter(runner: RoutinesRunner): Hono {
 
 	app.get("/routines/:id/runs", (c) => {
 		const id = c.req.param("id");
-		const limit = Number(c.req.query("limit") ?? "20");
+		const rawLimit = c.req.query("limit");
+		const limit = rawLimit === undefined ? 20 : Number(rawLimit);
+		if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+			return c.json({ error: "limit must be an integer between 1 and 500" }, 400);
+		}
 		const body: ListRoutineRunsResponse = { runs: listRuns(id, limit) };
 		return c.json(body);
 	});

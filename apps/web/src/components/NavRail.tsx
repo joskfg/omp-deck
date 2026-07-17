@@ -1,4 +1,4 @@
-import { Activity, BookOpen, BotMessageSquare, ChartNoAxesCombined, Clock, Inbox, KanbanSquare, MessagesSquare, Plug, Settings, Sparkles, Store } from "lucide-react";
+import { Activity, BookOpen, BotMessageSquare, Brain, ChartNoAxesCombined, Clock, Database, FolderCog, Inbox, KanbanSquare, MessagesSquare, Plug, Settings, ShieldCheck, Sparkles, Store } from "lucide-react";
 import { NavLink } from "react-router-dom";
 import { cn } from "@/lib/utils";
 
@@ -15,8 +15,12 @@ const ITEMS: ReadonlyArray<{
 	{ to: "/marketplace", label: "Marketplace", icon: Store },
 	{ to: "/skills", label: "Skills", icon: Sparkles },
 	{ to: "/kb", label: "Knowledge", icon: BookOpen },
+	{ to: "/memory", label: "Memory", icon: Brain },
 	{ to: "/integrations", label: "Integrations", icon: Plug },
 	{ to: "/auto-work", label: "Auto Work", icon: BotMessageSquare },
+	{ to: "/project-config", label: "Project Config", icon: FolderCog },
+	{ to: "/codebase-memory", label: "Codebase Memory", icon: Database },
+	{ to: "/governance", label: "Governance", icon: ShieldCheck },
 	{ to: "/subscription-limits", label: "Subscription limits", icon: ChartNoAxesCombined },
 ];
 

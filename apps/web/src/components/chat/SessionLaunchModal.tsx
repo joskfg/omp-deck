@@ -32,6 +32,12 @@ interface Props {
 	initialCwd: string;
 	/** When false, the workspace is fixed to `initialCwd` (still shown, read-only). */
 	allowWorkspaceChange?: boolean;
+	/**
+	 * Pre-selected model suggestion (T-109). When set, the model picker opens
+	 * with this model already chosen (modelTouched=true so the workspace default
+	 * doesn't override it). The user can still pick any other model.
+	 */
+	initialModel?: ModelRef;
 	onCancel: () => void;
 	/**
 	 * Creates the session. Throwing keeps the modal open with the error
@@ -62,6 +68,7 @@ export function SessionLaunchModal({
 	title = "New session",
 	confirmLabel = "Start session",
 	initialCwd,
+	initialModel,
 	allowWorkspaceChange = true,
 	onCancel,
 	onConfirm,
@@ -92,8 +99,8 @@ export function SessionLaunchModal({
 		setSelectedCwd(initialCwd || defaultCwd);
 		setCustomCwd("");
 		setPlanMode(false);
-		setModel(undefined);
-		setModelTouched(false);
+		setModel(initialModel ?? undefined);
+		setModelTouched(initialModel !== undefined);
 		setThinking(undefined);
 		setThinkingTouched(false);
 		setInitialPrompt("");

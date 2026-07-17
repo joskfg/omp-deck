@@ -125,7 +125,7 @@ describe("ModelCatalogOverlay.recordFailure", () => {
 		expect(first?.reason).toBe("unauthorized");
 	});
 
-	it("does not shadow on 5xx / server errors", async () => {
+	it("does not shadow on 5xx / server errors, including rate-limit / timeout", async () => {
 		const { overlay } = makeHarness();
 		const shadowed = overlay.recordFailure(
 			{ provider: "anthropic", id: "claude-opus-4-1" },
@@ -133,15 +133,15 @@ describe("ModelCatalogOverlay.recordFailure", () => {
 		);
 		expect(shadowed).toBe(false);
 		expect(overlay.listShadowed()).toHaveLength(0);
-	});
 
-	it("does not shadow on rate-limit / timeout", async () => {
-		const { overlay } = makeHarness();
-		const shadowed = overlay.recordFailure(
+		// Rate-limit/timeout messages classify to the same "server" kind via the
+		// substring branch and must not shadow the model either — distinct,
+		// human-meaningful business rule from generic 5xx handling.
+		const rateLimited = overlay.recordFailure(
 			{ provider: "openai", id: "gpt-5" },
 			makeError("429", "rate limit exceeded"),
 		);
-		expect(shadowed).toBe(false);
+		expect(rateLimited).toBe(false);
 	});
 
 	it("does not shadow on unknown errors", async () => {

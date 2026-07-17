@@ -304,3 +304,21 @@ function isLoopbackRequest(req: Request): boolean {
 	return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
 }
 
+/**
+ * Best-effort sync of the canonical workspace list to `OMP_DECK_WORKSPACES`
+ * in the managed env store (T-134). Returns `true` when the env var was
+ * updated in-process, `false` when it is owned by the launching shell and
+ * cannot be overwritten at runtime — callers fall back to the DB lists in
+ * that case and still succeed.
+ */
+export async function syncWorkspacesToEnv(cwds: string[], config: Config): Promise<boolean> {
+	// Shell-set vars are NOT in MANAGED_ENV_KEYS_LOADED; we must not clobber them.
+	const ownedByManaged =
+		MANAGED_ENV_KEYS_LOADED.has("OMP_DECK_WORKSPACES") || process.env.OMP_DECK_WORKSPACES === undefined;
+	if (!ownedByManaged) return false;
+	const newValue = cwds.length > 0 ? cwds.join(",") : null;
+	await writeManagedEnvUpdates({ OMP_DECK_WORKSPACES: newValue });
+	applyManagedEnvUpdatesToProcess({ OMP_DECK_WORKSPACES: newValue });
+	config.extraWorkspaces = splitList(newValue ?? "").map((p) => path.resolve(p));
+	return true;
+}

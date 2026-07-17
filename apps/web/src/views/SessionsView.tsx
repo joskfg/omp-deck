@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, MessageSquare, RefreshCw, Trash2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import type { SessionMonitorEntry, SessionMonitorStatus } from "@omp-deck/protocol";
@@ -25,6 +25,7 @@ export function SessionsView() {
 	const [selectedId, setSelectedId] = useState<string>();
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string>();
+	const refreshSequence = useRef(0);
 
 	const handleDelete = useCallback(
 		async (id: string) => {
@@ -42,14 +43,17 @@ export function SessionsView() {
 	);
 
 	const refresh = useCallback(async () => {
+		const sequence = ++refreshSequence.current;
 		try {
 			const response = await api.listSessionMonitor(workspace || undefined);
+			if (sequence !== refreshSequence.current) return;
 			setSessions(response.sessions);
 			setError(undefined);
 		} catch (err) {
+			if (sequence !== refreshSequence.current) return;
 			setError(err instanceof Error ? err.message : String(err));
 		} finally {
-			setLoading(false);
+			if (sequence === refreshSequence.current) setLoading(false);
 		}
 	}, [workspace]);
 

@@ -51,6 +51,11 @@ describe("auto-work config", () => {
 				P4: null,
 				P5: null,
 			},
+			modelByDifficulty: {
+				easy: null,
+				medium: { provider: "anthropic", id: "claude-medium" },
+				hard: { provider: "anthropic", id: "claude-hard" },
+			},
 			timeWindows: [{ start: 8, end: 20 }],
 			sessionPctLimit: 30,
 			weeklyPctLimit: 75,
@@ -69,6 +74,9 @@ describe("auto-work config", () => {
 		expect(stored.defaultEstimatePctByPriority).toEqual({ P0: 25, P1: 15, P2: 10, P3: 8, P4: 5, P5: 3 });
 		expect(stored.estimationBuffer).toBe(1.5);
 		expect(stored.timeoutMinutesByPriority).toEqual({ P0: 100, P1: 80, P2: 50, P3: 40, P4: 40, P5: 40 });
+		expect(stored.modelByDifficulty.easy).toBeNull();
+		expect(stored.modelByDifficulty.medium).toEqual({ provider: "anthropic", id: "claude-medium" });
+		expect(stored.modelByDifficulty.hard).toEqual({ provider: "anthropic", id: "claude-hard" });
 
 		const fetched = getAutoWorkConfig("/tmp/project-a");
 		expect(fetched).toEqual(stored);

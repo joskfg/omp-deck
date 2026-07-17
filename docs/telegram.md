@@ -2,8 +2,8 @@
 
 The Telegram bridge lets you chat with the omp agent from any Telegram
 client — phone, desktop, web. DMs to your bot create or resume an omp
-session keyed by `chat_id`; the agent's replies stream back via Telegram's
-`editMessageText`.
+session keyed by `chat_id`. The bridge waits for the agent's turn to finish
+and replies with the turn's final result only, never the intermediate flow.
 
 The bridge is a **standalone Bun process** in `apps/bridges/telegram/`,
 supervised by the deck server. Crashing the bridge does not affect the
@@ -58,10 +58,12 @@ Within a few seconds the bridge:
 1. Creates a new omp session at `OMP_DECK_DEFAULT_CWD` (or the cwd of the
    chat-to-session mapping if you've messaged the bot before).
 2. Forwards your text as a prompt.
-3. Streams the agent's reply back, edited in real-time via
-   `editMessageText` to avoid spamming you with one message per token.
+3. Waits for the agent turn to finish, then sends the final assistant
+   message as the reply — no tool calls, thinking, or partial text is ever
+   sent, and nothing is sent until the turn ends. If the turn produces no
+   final text, the bridge replies with "Turn complete.".
 
-If the agent's reply exceeds Telegram's 4096-char message cap, the bridge
+If the final reply exceeds Telegram's 4096-char message cap, the bridge
 chunks it across multiple messages.
 
 ## Image attachments
@@ -129,12 +131,7 @@ Check logs (expand "Bridge logs" in the card). The most common cause is
 the user not being in the allowlist — the bridge replies with
 "This omp-deck bot is private." and refuses to process.
 
-**Replies are slow.**
-The bridge debounces `editMessageText` calls at `TELEGRAM_EDIT_INTERVAL_MS`
-(default 700ms) to avoid Telegram rate limits. Tune in `.env`:
-
-```sh
-TELEGRAM_EDIT_INTERVAL_MS=300
-```
-
-Lower bound is 250ms — Telegram will reject faster updates.
+**Replies only arrive once the agent turn finishes.**
+By design (T-125) the bridge never sends a partial preview — a long coding
+turn means a long wait before any reply, not a stream of intermediate
+messages. There is no interval to tune for this.

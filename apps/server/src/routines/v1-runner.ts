@@ -205,8 +205,20 @@ export async function runV1Pipeline(input: {
 				status: "running",
 				startedAt: new Date().toISOString(),
 			});
+			const attemptStartedMs = Date.now();
 
-			const result = await dispatchStep(step, context, abortSignal, defaultCwd, stepCwd, runId, routine.id, ensureAgentSandbox);
+			let result: StepResult;
+			try {
+				result = await dispatchStep(step, context, abortSignal, defaultCwd, stepCwd, runId, routine.id, ensureAgentSandbox);
+			} catch (err) {
+				result = {
+					status: "failed",
+					stdoutExcerpt: "",
+					stderrExcerpt: "",
+					error: String(err),
+					durationMs: Date.now() - attemptStartedMs,
+				};
+			}
 			lastResult = result;
 			finishStepRun(stepRunId, {
 				status: result.status,

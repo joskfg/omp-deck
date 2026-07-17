@@ -1,3 +1,5 @@
+import * as path from "node:path";
+import { prepareCodebaseMemoryMcpRuntime } from "../codebase-memory-mcp.ts";
 import {
 	createAgentSession,
 	ModelRegistry,
@@ -44,7 +46,9 @@ import type {
 	SessionSnapshot,
 	UsageRollupWire,
 	SessionSummary,
+	SessionTreeResponse,
 } from "@omp-deck/protocol";
+
 
 import type { DeckSlashResult } from "../deck-slash-commands.ts";
 import { logger } from "../log.ts";
@@ -57,8 +61,10 @@ import { ExtensionUIBridge } from "./ext-ui-bridge.ts";
 import { GoalModeBridge } from "./goal-mode-bridge.ts";
 import type { GoalAction, GoalModeSessionSurface, GoalModeState } from "./goal-mode-bridge.ts";
 import { PlanModeBridge } from "./plan-mode-bridge.ts";
-import type { PlanModelController, PlanModeSessionSurface } from "./plan-mode-bridge.ts";
+import type { PersistedPlanModeData, PlanModelController, PlanModeSessionSurface } from "./plan-mode-bridge.ts";
 import { getPlanModel } from "../db/server-settings.ts";
+import { summarizeSession } from "./session-normalizer.ts";
+import { forkSessionFile, readSessionTree } from "./session-tree.ts";
 import type {
 	AgentBridge,
 	CreateSessionOpts,
@@ -70,6 +76,8 @@ import type {
 	SessionHandle,
 	SlashDispatchResult,
 } from "./types.ts";
+
+
 
 const log = logger("bridge:in-process");
 
@@ -97,7 +105,13 @@ export function sliceHistoryPage(
 
 
 /**
- * Sum token/cost usage across every assistant message in `messages`.
+ * Sum token/cost usage across every assistant message in `messages`, plus
+ * aggregated sub-agent usage from successful `task` tool-result messages
+ * (T-97). The task tool stores the cross-subagent total in
+ * `toolResult.details.usage`; including it here keeps the snapshot
+ * `usageRollup` consistent with the live reducer's `rollupUsage` path
+ * so the CostStrip remains correct after a reconnect or page refresh.
+ *
  * Mirrors the web reducer's `extractUsage`/`rollupUsage` semantics so a
  * tail-sliced snapshot can seed the client's cost strip with full-history
  * totals.
@@ -105,19 +119,43 @@ export function sliceHistoryPage(
 export function computeUsageRollup(messages: AgentMessageJson[]): UsageRollupWire {
 	const rollup: UsageRollupWire = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0 };
 	for (const msg of messages) {
-		if (!msg || msg.role !== "assistant") continue;
-		const usage = (msg as Record<string, unknown>).usage;
-		if (!usage || typeof usage !== "object") continue;
-		const u = usage as Record<string, unknown>;
-		rollup.input += Number(u.input ?? 0) || 0;
-		rollup.output += Number(u.output ?? 0) || 0;
-		rollup.cacheRead += Number(u.cacheRead ?? 0) || 0;
-		rollup.cacheWrite += Number(u.cacheWrite ?? 0) || 0;
-		rollup.totalTokens += Number(u.totalTokens ?? 0) || 0;
-		const cost = u.cost && typeof u.cost === "object" ? Number((u.cost as Record<string, unknown>).total ?? 0) : 0;
-		rollup.cost += Number.isFinite(cost) ? cost : 0;
-		if (typeof u.reasoningTokens === "number") {
-			rollup.reasoningTokens = (rollup.reasoningTokens ?? 0) + u.reasoningTokens;
+		if (!msg) continue;
+		const m = msg as Record<string, unknown>;
+
+		if (msg.role === "assistant") {
+			const usage = m.usage;
+			if (!usage || typeof usage !== "object") continue;
+			const u = usage as Record<string, unknown>;
+			rollup.input += Number(u.input ?? 0) || 0;
+			rollup.output += Number(u.output ?? 0) || 0;
+			rollup.cacheRead += Number(u.cacheRead ?? 0) || 0;
+			rollup.cacheWrite += Number(u.cacheWrite ?? 0) || 0;
+			rollup.totalTokens += Number(u.totalTokens ?? 0) || 0;
+			const cost = u.cost && typeof u.cost === "object" ? Number((u.cost as Record<string, unknown>).total ?? 0) : 0;
+			rollup.cost += Number.isFinite(cost) ? cost : 0;
+			if (typeof u.reasoningTokens === "number") {
+				rollup.reasoningTokens = (rollup.reasoningTokens ?? 0) + u.reasoningTokens;
+			}
+			continue;
+		}
+
+		// T-97: roll up aggregated sub-agent usage from successful task tool calls.
+		// `ToolResultMessage.details.usage` carries the cross-subagent total that
+		// the task tool accumulates in-process — the same value the live reducer
+		// rolls up via the `tool_execution_end` handler.
+		if (msg.role === "toolResult" && m.toolName === "task" && !m.isError) {
+			const details = m.details;
+			if (!details || typeof details !== "object") continue;
+			const usage = (details as Record<string, unknown>).usage;
+			if (!usage || typeof usage !== "object") continue;
+			const u = usage as Record<string, unknown>;
+			rollup.input += Number(u.input ?? 0) || 0;
+			rollup.output += Number(u.output ?? 0) || 0;
+			rollup.cacheRead += Number(u.cacheRead ?? 0) || 0;
+			rollup.cacheWrite += Number(u.cacheWrite ?? 0) || 0;
+			rollup.totalTokens += Number(u.totalTokens ?? 0) || 0;
+			const cost = u.cost && typeof u.cost === "object" ? Number((u.cost as Record<string, unknown>).total ?? 0) : 0;
+			rollup.cost += Number.isFinite(cost) ? cost : 0;
 		}
 	}
 	return rollup;
@@ -163,13 +201,6 @@ interface Active {
 	goalBridge: GoalModeBridge;
 }
 
-function readSessionManagerId(sessionManager: unknown): string | undefined {
-	if (!sessionManager || typeof sessionManager !== "object" || !("getSessionId" in sessionManager)) return undefined;
-	const getSessionId = sessionManager.getSessionId;
-	if (typeof getSessionId !== "function") return undefined;
-	const sessionId = getSessionId.call(sessionManager);
-	return typeof sessionId === "string" ? sessionId : undefined;
-}
 
 export class InProcessAgentBridge implements AgentBridge {
 	private active = new Map<string, Active>();
@@ -180,11 +211,17 @@ export class InProcessAgentBridge implements AgentBridge {
 	/** Shared SDK model registry, lazily constructed on first session create. */
 	private modelRegistry: ModelRegistry | undefined;
 	private modelRegistryPromise: Promise<ModelRegistry> | undefined;
+	/** Extension load errors from the most recent `createSession`/`resumeSession`
+	 *  call, keyed by the resulting session id — read once by the agent worker
+	 *  right after session creation and forwarded to the parent process for
+	 *  the governance audit trail (T-35), then discarded. */
+	private pendingExtensionLoadErrors = new Map<string, Array<{ path: string; error: string }>>();
 
 	constructor(opts: {
 		idleTimeoutMs?: number;
 		reapIntervalMs?: number;
 	} = {}) {
+		prepareCodebaseMemoryMcpRuntime();
 		this.idleTimeoutMs = opts.idleTimeoutMs ?? 15 * 60_000; // 15 min default
 		this.reapIntervalMs = opts.reapIntervalMs ?? 60_000; // scan once a minute
 		if (this.idleTimeoutMs > 0) this.startReaper();
@@ -234,6 +271,7 @@ export class InProcessAgentBridge implements AgentBridge {
 		}
 		if (!opts.internal) await this.wireExtensionRunner(session);
 		const handle = await this.attach(session, opts.cwd, sessionManager, result.setToolUIContext, !opts.internal);
+		if (ext?.errors?.length) this.pendingExtensionLoadErrors.set(handle.sessionId, ext.errors);
 		if (opts.planMode) {
 			await handle.setPlanMode(true);
 		}
@@ -242,15 +280,24 @@ export class InProcessAgentBridge implements AgentBridge {
 	}
 
 	async resumeSession(opts: ResumeSessionOpts): Promise<SessionHandle> {
-		const sessionManager = await SessionManager.open(opts.sessionPath);
-		const existingSessionId = readSessionManagerId(sessionManager);
-		if (existingSessionId) {
-			const existing = this.active.get(existingSessionId);
-			if (existing) {
-				log.info(`resume requested for active session ${existingSessionId}; retaining the live instance`);
-				return existing.handle;
+		// T-32: an auto-handoff mid-session leaves a NEW file actively being
+		// written by an already-live handle whose own `sessionId` (and this
+		// bridge's `active` map key) stays pinned to the PRE-handoff id — so
+		// matching by id alone can both miss the live continuation (its file
+		// moved, id didn't) and wrongly return it for an id that matches but
+		// whose file has since diverged (e.g. resuming the handoff's ORIGIN
+		// file, whose own on-disk id is unchanged). Match by CURRENT file
+		// only — see attach()'s collision handling for the id-collision half
+		// of this (a fresh attach for a diverged id gets a disambiguated key
+		// instead of superseding the still-live handle).
+		const resolvedTarget = path.resolve(opts.sessionPath);
+		for (const active of this.active.values()) {
+			if (active.handle.sessionFile && path.resolve(active.handle.sessionFile) === resolvedTarget) {
+				log.info(`resume requested for a file already live under session ${active.handle.sessionId}; retaining the live instance`);
+				return active.handle;
 			}
 		}
+		const sessionManager = await SessionManager.open(opts.sessionPath);
 		const cwd = (sessionManager.getCwd?.() as string | undefined) ?? process.cwd();
 		const modelRegistry = await this.ensureModelRegistry();
 		const result = await createAgentSession({
@@ -264,6 +311,9 @@ export class InProcessAgentBridge implements AgentBridge {
 		});
 		const session = result.session;
 		const handle = await this.attach(session, cwd, sessionManager, result.setToolUIContext, true);
+		if (result.extensionsResult?.errors?.length) {
+			this.pendingExtensionLoadErrors.set(handle.sessionId, result.extensionsResult.errors);
+		}
 		await this.wireExtensionRunner(session);
 		log.info(`resumed session ${handle.sessionId} from ${opts.sessionPath}`);
 		return handle;
@@ -274,11 +324,20 @@ export class InProcessAgentBridge implements AgentBridge {
 		return this.active.get(sessionId)?.handle;
 	}
 
+	/** One-shot read of extension load errors captured for `sessionId` during
+	 *  session creation/resume (T-35). Clears the entry so a later call for
+	 *  the same id returns empty rather than re-delivering stale errors. */
+	takeExtensionLoadErrors(sessionId: string): Array<{ path: string; error: string }> {
+		const errors = this.pendingExtensionLoadErrors.get(sessionId);
+		this.pendingExtensionLoadErrors.delete(sessionId);
+		return errors ?? [];
+	}
+
 	async listSessions(opts: { cwd?: string }): Promise<SessionSummary[]> {
 		const raw = opts.cwd
 			? await SessionManager.list(opts.cwd)
 			: await SessionManager.listAll();
-		return raw.map((r: any) => summarize(r));
+		return raw.map(r => summarizeSession(r));
 	}
 
 	/**
@@ -294,13 +353,9 @@ export class InProcessAgentBridge implements AgentBridge {
 	 */
 	async deleteSession(sessionId: string): Promise<{ deleted: boolean; sessionPath?: string }> {
 		const active = this.active.get(sessionId);
-		let sessionPath = active?.handle.sessionFile;
+		const sessionPath = await this.resolveSessionPath(sessionId);
 		if (active) {
 			await active.handle.dispose();
-		}
-		if (!sessionPath) {
-			const persisted = await this.listAllSessionsForDelete();
-			sessionPath = persisted.find((s) => s.id === sessionId)?.path;
 		}
 		if (!sessionPath) {
 			return { deleted: false };
@@ -312,6 +367,33 @@ export class InProcessAgentBridge implements AgentBridge {
 			if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
 		}
 		return { deleted: true, sessionPath };
+	}
+
+	/**
+	 * Resolve `sessionId` to its `.jsonl` path without disturbing a live
+	 * handle: the live handle's `sessionFile` first, else a
+	 * `listAllSessionsForDelete()` match for a persisted-only session.
+	 * Shared by `deleteSession`, `getSessionTree` and `forkSessionAt`.
+	 */
+	private async resolveSessionPath(sessionId: string): Promise<string | undefined> {
+		const live = this.active.get(sessionId)?.handle.sessionFile;
+		if (live) return live;
+		const persisted = await this.listAllSessionsForDelete();
+		return persisted.find((s) => s.id === sessionId)?.path;
+	}
+
+	/** @inheritdoc */
+	async getSessionTree(sessionId: string): Promise<SessionTreeResponse | undefined> {
+		const sessionPath = await this.resolveSessionPath(sessionId);
+		if (!sessionPath) return undefined;
+		return readSessionTree(sessionPath);
+	}
+
+	/** @inheritdoc */
+	async forkSessionAt(sessionId: string, entryId: string): Promise<{ sessionFile: string; cwd: string } | undefined> {
+		const sessionPath = await this.resolveSessionPath(sessionId);
+		if (!sessionPath) return undefined;
+		return forkSessionFile(sessionPath, entryId);
 	}
 
 	/**
@@ -544,7 +626,28 @@ export class InProcessAgentBridge implements AgentBridge {
 		setToolUIContext: CreateAgentSessionResult["setToolUIContext"],
 		hasUI: boolean,
 	): Promise<InProcessSessionHandle> {
-		const sessionId = (session as any).sessionId as string;
+		const naturalSessionId = (session as any).sessionId as string;
+		// T-32: disambiguate a collision where the existing `active` entry is a
+		// LIVE session that has since auto-handed-off onto a DIFFERENT file —
+		// its own map key stays pinned to its pre-handoff id by design (see
+		// session-handoff.ts docs), so a fresh attach for that id's ORIGINAL
+		// file (e.g. the handoff banner's "origin" link, or any independent
+		// resume of it) collides on id alone. That's a legitimate, INDEPENDENT
+		// reattachment, not a duplicate — give it its own identity instead of
+		// falling into the supersede/dispose path below, which would kill the
+		// still-live continuation. A genuine duplicate attach (same file,
+		// same id) is unaffected and still supersedes as before.
+		const existingForNaturalId = this.active.get(naturalSessionId);
+		const thisAttachFile = sessionManager.getSessionFile();
+		const isDivergedHandoffOrigin =
+			existingForNaturalId !== undefined &&
+			existingForNaturalId.handle.sessionFile !== undefined &&
+			thisAttachFile !== undefined &&
+			path.resolve(existingForNaturalId.handle.sessionFile) !== path.resolve(thisAttachFile);
+		// Plain fresh UUID, not `${naturalSessionId}-<suffix>` — the web
+		// router builds `/c/${sessionId}` unencoded, so any separator with URL
+		// significance (`#`, `?`, `/`) would corrupt navigation/route parsing.
+		const sessionId = isDivergedHandoffOrigin ? Bun.randomUUIDv7() : naturalSessionId;
 		const uiBridge = new ExtensionUIBridge(sessionId);
 		// Internal backend sessions expose no interactive UI to SDK tools.
 		setToolUIContext(uiBridge, hasUI);
@@ -596,6 +699,11 @@ export class InProcessAgentBridge implements AgentBridge {
 			getArtifactsDir: () => (sessionManager as unknown as { getArtifactsDir: () => string | null }).getArtifactsDir(),
 			getSessionId: () => (sessionManager as unknown as { getSessionId: () => string | null }).getSessionId(),
 			planModel: planModelController,
+			// T-29: durable plan-mode marker in the session .jsonl — the same
+			// `mode_change` entry the TUI writes — so resume can rehydrate below.
+			persistModeChange: (mode, data) => {
+				sessionManager.appendModeChange(mode, data);
+			},
 		});
 
 		const goalBridge = new GoalModeBridge(
@@ -603,7 +711,9 @@ export class InProcessAgentBridge implements AgentBridge {
 			() => planBridge.exit("user_cancelled"),
 		);
 
-		const handle = new InProcessSessionHandle({
+		let handle: InProcessSessionHandle;
+		let unsubscribe: (() => void) | undefined;
+		handle = new InProcessSessionHandle({
 			session,
 			sessionManager,
 			cwd,
@@ -612,16 +722,25 @@ export class InProcessAgentBridge implements AgentBridge {
 			planBridge,
 			goalBridge,
 			onDispose: () => {
+				const active = this.active.get(sessionId);
+				if (active?.handle === handle) {
+					active.unsubscribe();
+					this.active.delete(sessionId);
+				} else {
+					unsubscribe?.();
+				}
 				uiBridge.dispose();
 				goalBridge.dispose();
 				planBridge.dispose();
-				this.active.delete(sessionId);
 			},
 		});
 
 		// Bridge SDK events to handle's listeners, AND to bridge-internal activity
 		// tracking so the reaper sees real agent work and won't kill an in-flight turn.
-		const unsubscribe = session.subscribe((event) => {
+		// T-32: tracks an in-flight auto-handoff between its start and end event
+		// (see PendingHandoff doc comment).
+		let pendingHandoff: PendingHandoff | undefined;
+		unsubscribe = session.subscribe((event) => {
 			const entry = this.active.get(sessionId);
 			if (entry) {
 				entry.lastActivityAt = Date.now();
@@ -636,6 +755,43 @@ export class InProcessAgentBridge implements AgentBridge {
 			// changes: a turn finishing (fresh assistant usage now available)
 			// or a compaction completing (post-compaction context shrunk).
 			const type = (event as { type?: string })?.type;
+			// T-32: auto-handoff compaction (`compaction.strategy = "handoff"`)
+			// generates a summary and swaps the live session onto a brand-new
+			// file+id via the SDK's own `SessionManager.newSession()` — invisible
+			// to the deck otherwise. Stash the pre-swap identity on start, then
+			// emit a deck-synthetic `session_handoff` event on a successful end so
+			// the web client can show why/when it happened and the new identity
+			// (this handle's live `sessionFile` getter DOES follow the swap — used
+			// below for `newSessionFile` — but its `sessionId` and this bridge's
+			// `active` map key deliberately stay pinned to the pre-handoff id; see
+			// session-handoff.ts module docs for why re-keying the live
+			// registration is out of scope).
+			if (type === "auto_compaction_start" && readStringField(event, "action") === "handoff") {
+				pendingHandoff = {
+					// The FILE-level id right now, not the outer `sessionId` closure
+					// (pinned once at attach() time, for WS-routing purposes only) —
+					// a SECOND handoff on the same live handle must report the id the
+					// first one produced as "previous", not the original pre-any-
+					// handoff id.
+					previousSessionId: sessionManager.getSessionId(),
+					previousSessionFile: handle.sessionFile,
+					reason: readStringField(event, "reason") ?? "",
+				};
+			} else if (type === "auto_compaction_end" && readStringField(event, "action") === "handoff") {
+				const handoff = pendingHandoff;
+				pendingHandoff = undefined;
+				if (handoff && readBooleanField(event, "aborted") !== true) {
+					handle.emit({
+						type: "session_handoff",
+						reason: handoff.reason,
+						previousSessionId: handoff.previousSessionId,
+						previousSessionFile: handoff.previousSessionFile,
+						newSessionId: sessionManager.getSessionId(),
+						newSessionFile: handle.sessionFile,
+						timestamp: Date.now(),
+					} as unknown as AgentSessionEventJson);
+				}
+			}
 			if (type === "turn_end" || type === "agent_end" || type === "compaction_complete") {
 				const usage = handle.getContextUsage();
 				if (usage) {
@@ -708,20 +864,24 @@ export class InProcessAgentBridge implements AgentBridge {
 			planBridge,
 			goalBridge,
 		});
-		const persistedGoal = sessionManager.buildSessionContext() as unknown as {
+		const persistedMode = sessionManager.buildSessionContext() as unknown as {
 			mode?: string;
-			modeData?: { goal?: GoalModeState["goal"] };
+			modeData?: { goal?: GoalModeState["goal"] } & PersistedPlanModeData;
 		};
-		if (persistedGoal.mode === "goal" || persistedGoal.mode === "goal_paused") {
+		if (persistedMode.mode === "goal" || persistedMode.mode === "goal_paused") {
 			await goalBridge.restore(
-				persistedGoal.modeData?.goal
+				persistedMode.modeData?.goal
 					? {
-						enabled: persistedGoal.mode === "goal",
+						enabled: persistedMode.mode === "goal",
 						mode: "active",
-						goal: persistedGoal.modeData.goal,
+						goal: persistedMode.modeData.goal,
 					}
 					: undefined,
 			);
+		} else if (persistedMode.mode === "plan") {
+			// T-29: a reopened plan session recovers plan mode, its plan file
+			// and any proposal that was pending when the previous process died.
+			await planBridge.restore(persistedMode.modeData);
 		}
 		return handle;
 	}
@@ -915,6 +1075,29 @@ function readStringField(value: unknown, key: string): string | undefined {
 	const v = (value as Record<string, unknown>)[key];
 	return typeof v === "string" ? v : undefined;
 }
+
+function readBooleanField(value: unknown, key: string): boolean | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	if (!(key in value)) return undefined;
+	const v = (value as Record<string, unknown>)[key];
+	return typeof v === "boolean" ? v : undefined;
+}
+
+/**
+ * T-32: mutable in-flight marker for an auto-handoff compaction. Stashed on
+ * `auto_compaction_start` (action "handoff", while `handle.sessionFile`
+ * still points at the pre-handoff file) and consumed on the matching
+ * `auto_compaction_end` once the SDK's `newSession()` swap has completed —
+ * at that point `handle.sessionFile`/`sessionManager.getSessionId()` report
+ * the new identity. Scoped per `attach()` call (one live handle), never
+ * shared across sessions.
+ */
+interface PendingHandoff {
+	previousSessionId: string;
+	previousSessionFile?: string;
+	reason: string;
+}
+
 export class InProcessSessionHandle implements SessionHandle {
 	readonly sessionId: string;
 	readonly cwd: string;
@@ -1038,6 +1221,7 @@ export class InProcessSessionHandle implements SessionHandle {
 			sessionId: this.sessionId,
 			sessionFile: this.sessionFile,
 			sessionName: typeof s.sessionName === "string" ? s.sessionName : undefined,
+			parentSessionPath: this.sessionManager.getHeader()?.parentSession,
 			cwd: this.cwd,
 			model:
 				s.model && typeof s.model === "object"
@@ -1057,6 +1241,11 @@ export class InProcessSessionHandle implements SessionHandle {
 			// entries retain the latest list for reconnects and snapshots.
 			todoPhases: getLatestTodoPhasesFromEntries(this.sessionManager.getBranch()) as unknown as Array<Record<string, unknown>>,
 		};
+		// T-32: this session's origin file, if it was forked or continues an
+		// automatic context handoff. Sync/free — `getHeader()` reads the
+		// already-loaded in-memory header, no disk I/O.
+		const parentSessionPath = this.sessionManager.getHeader()?.parentSession;
+		if (parentSessionPath) snap.parentSessionPath = parentSessionPath;
 		if (usage) snap.contextUsage = usage;
 		const planMode = this.planBridge.getPlanModeContext();
 		if (planMode) {
@@ -1138,6 +1327,25 @@ export class InProcessSessionHandle implements SessionHandle {
 		await s.setModel(model);
 		// Synthetic event so WS subscribers refresh the session header's model
 		// label without waiting for the next assistant turn.
+		this.emit({ type: "session_updated", snapshot: this.snapshot() } as unknown as AgentSessionEventJson);
+	}
+
+	async setThinkingLevel(level: string): Promise<void> {
+		if (this.planBridge.getPlanModeContext()?.modelOverride) {
+			throw new Error("thinking cannot change while Plan Mode overrides the model");
+		}
+		if (this.isStreamingNow()) {
+			throw new Error("thinking cannot change while a turn is streaming");
+		}
+		const parsed = parseConfiguredThinkingLevel(level);
+		if (!parsed) throw new Error(`invalid thinking level: ${level}`);
+		const s = this.session as unknown as {
+			setThinkingLevel?: (level: typeof parsed) => void;
+		};
+		if (typeof s.setThinkingLevel !== "function") {
+			throw new Error("session.setThinkingLevel is not available on this SDK build");
+		}
+		s.setThinkingLevel(parsed);
 		this.emit({ type: "session_updated", snapshot: this.snapshot() } as unknown as AgentSessionEventJson);
 	}
 
@@ -1511,47 +1719,6 @@ export class InProcessSessionHandle implements SessionHandle {
 		}
 		this.onDisposeCallback();
 	}
-}
-
-
-/** Compute elapsed ms between two ISO timestamps. Returns undefined when either
- * is invalid or updatedAt is not after createdAt (stale / corrupted records). */
-function computeDurationMs(createdAt: string, updatedAt: string): number | undefined {
-	if (!createdAt || !updatedAt) return undefined;
-	const c = new Date(createdAt).getTime();
-	const u = new Date(updatedAt).getTime();
-	if (Number.isNaN(c) || Number.isNaN(u)) return undefined;
-	const diff = u - c;
-	return diff > 0 ? diff : undefined;
-}
-
-/** Normalize a SessionManager.list / listAll record into our SessionSummary. */
-function summarize(raw: any): SessionSummary {
-	// omp's list returns objects like:
-	//   { id, path, cwd, title?, timestamp, messageCount?, modifiedAt? }
-	const id = String(raw.id ?? raw.sessionId ?? raw.header?.id ?? "");
-	const filePath = String(raw.path ?? raw.file ?? raw.sessionFile ?? "");
-	const cwd = String(raw.cwd ?? raw.header?.cwd ?? "");
-	const title =
-		typeof raw.title === "string"
-			? raw.title
-			: typeof raw.header?.title === "string"
-				? raw.header.title
-				: undefined;
-	const createdAt = String(raw.timestamp ?? raw.createdAt ?? raw.header?.timestamp ?? "");
-	const updatedAt = String(raw.modifiedAt ?? raw.updatedAt ?? createdAt);
-	const messageCount = Number(raw.messageCount ?? raw.count ?? 0);
-	const durationMs = computeDurationMs(createdAt, updatedAt);
-	return {
-		id,
-		path: filePath,
-		cwd,
-		title,
-		createdAt,
-		updatedAt,
-		messageCount,
-		durationMs,
-	};
 }
 
 /**

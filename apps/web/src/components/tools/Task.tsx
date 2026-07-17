@@ -4,7 +4,7 @@ import { extractResultDetails, extractResultText } from "./shared";
 import { MaybeJsonBlock } from "@/lib/code";
 import { api } from "@/lib/api";
 import { useStore } from "@/lib/store";
-import { formatBytes, formatCost, formatDurationMs, formatTokens, truncate, cn } from "@/lib/utils";
+import { formatBytes, formatCost, formatDurationMs, formatTokens, truncate, cn, extractSubagentCost } from "@/lib/utils";
 import { Modal } from "@/components/ui/Modal";
 
 const STATUS_TONE: Record<string, string> = {
@@ -44,7 +44,7 @@ type SubagentResult = {
 	abortReason?: string;
 	durationMs?: number;
 	tokens?: number;
-	usage?: { cost?: number };
+	usage?: { cost?: unknown };
 	patchPath?: string;
 	branchName?: string;
 	branchBaseSha?: string;
@@ -138,7 +138,7 @@ function ResultRow({ result, cwd, onInspect }: { result: SubagentResult; cwd?: s
 	const status = result.aborted ? "aborted" : result.error || (result.exitCode ?? 0) !== 0 ? "failed" : "completed";
 	const id = result.id ?? result.agent ?? "subagent";
 	const artifact = result.patchPath ? { patchPath: result.patchPath } : result.branchName ? { branchName: result.branchName, branchBaseSha: result.branchBaseSha } : null;
-
+	const resultCost = extractSubagentCost(result.usage?.cost);
 	function clearConfirmSoon(action: "apply" | "discard"): void {
 		setConfirm(action);
 		window.setTimeout(() => setConfirm((current) => (current === action ? null : current)), 3000);
@@ -165,7 +165,7 @@ function ResultRow({ result, cwd, onInspect }: { result: SubagentResult; cwd?: s
 		<div className="border-l border-line pl-2">
 			<div className="flex items-baseline justify-between gap-2 font-mono text-2xs"><span className="truncate font-medium text-ink">{id}</span><span className={cn("shrink-0", STATUS_TONE[status])}>{status}</span></div>
 			{result.agent ? <div className="mt-0.5 text-2xs text-ink-3">{result.agent}</div> : null}
-			<div className="mt-0.5 flex flex-wrap gap-x-2 font-mono text-2xs text-ink-4">{typeof result.durationMs === "number" ? <span>{formatDurationMs(result.durationMs)}</span> : null}{typeof result.tokens === "number" ? <span>{formatTokens(result.tokens)} tokens</span> : null}{typeof result.usage?.cost === "number" ? <span>{formatCost(result.usage.cost)}</span> : null}</div>
+		<div className="mt-0.5 flex flex-wrap gap-x-2 font-mono text-2xs text-ink-4">{typeof result.durationMs === "number" ? <span>{formatDurationMs(result.durationMs)}</span> : null}{typeof result.tokens === "number" ? <span>{formatTokens(result.tokens)} tokens</span> : null}{typeof resultCost === "number" ? <span>{formatCost(resultCost)}</span> : null}</div>
 			{result.error || result.abortReason ? <details className="mt-1 text-2xs text-danger"><summary className="cursor-pointer">error details</summary><div className="mt-1 whitespace-pre-wrap">{truncate(result.error ?? result.abortReason ?? "", 200)}</div></details> : null}
 			{result.output ? <details className="mt-1 text-2xs text-ink-3"><summary className="cursor-pointer">output</summary><div className="mt-1 whitespace-pre-wrap">{truncate(result.output, 800)}</div></details> : null}
 			{artifact ? (

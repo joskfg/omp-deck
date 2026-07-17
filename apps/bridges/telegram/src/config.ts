@@ -11,7 +11,6 @@ export interface TelegramBridgeConfig {
 	defaultCwd: string;
 	dbPath: string;
 	pollTimeoutSeconds: number;
-	editIntervalMs: number;
 }
 
 export function loadTelegramBridgeConfig(): TelegramBridgeConfig {
@@ -37,7 +36,6 @@ export function loadTelegramBridgeConfig(): TelegramBridgeConfig {
 		defaultCwd: deck.defaultCwd,
 		dbPath,
 		pollTimeoutSeconds: clamp(parseInt10(process.env.TELEGRAM_POLL_TIMEOUT_SECONDS, 30), 1, 50),
-		editIntervalMs: clamp(parseInt10(process.env.TELEGRAM_EDIT_INTERVAL_MS, 700), 250, 5000),
 	};
 }
 

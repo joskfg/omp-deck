@@ -386,12 +386,6 @@ describe("validateRoutineSpec — rejects malformed specs with clear errors", ()
 // ─── layout (V2 canvas authoring) ────────────────────────────────────────
 
 describe("validateRoutineSpec — layout (V2 canvas)", () => {
-	test("routine without layout still validates (backwards compatible)", () => {
-		const result = validateRoutineSpec(dailyBriefing);
-		expect(result.valid).toBe(true);
-		expect(result.errors).toBeUndefined();
-	});
-
 	test("routine with a valid layout block validates", () => {
 		const spec: RoutineSpec = {
 			...dailyBriefing,

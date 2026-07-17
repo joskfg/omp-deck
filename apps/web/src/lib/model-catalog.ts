@@ -45,13 +45,23 @@ export function useModelCatalog(sessionId?: string, active = true): UseModelCata
 
 	useEffect(() => {
 		if (!active) return;
+		let stale = false;
 		setLoading(true);
 		setError(undefined);
 		void api
 			.listModels(sessionId)
-			.then((resp) => setModels(resp.models))
-			.catch((err) => setError(String(err)))
-			.finally(() => setLoading(false));
+			.then((resp) => {
+				if (!stale) setModels(resp.models);
+			})
+			.catch((err) => {
+				if (!stale) setError(String(err));
+			})
+			.finally(() => {
+				if (!stale) setLoading(false);
+			});
+		return () => {
+			stale = true;
+		};
 	}, [active, sessionId, reloadKey]);
 
 	const availableCount = useMemo(() => models.filter((m) => m.isAvailable).length, [models]);

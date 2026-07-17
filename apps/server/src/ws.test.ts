@@ -417,3 +417,207 @@ describe("WsHub auto-title-on-first-prompt", () => {
 		}
 	});
 });
+
+describe("WsHub lifecycle failures", () => {
+	test("reserves concurrent session subscriptions and releases their one teardown", async () => {
+		let resolveSnapshot!: (snapshot: {}) => void;
+		const snapshot = new Promise<{}>((resolve) => {
+			resolveSnapshot = resolve;
+		});
+		const sessionListeners = new Set<EventListener>();
+		const uiListeners = new Set<(frame: unknown) => void>();
+		const planListeners = new Set<(frame: unknown) => void>();
+		let added = 0;
+		let removed = 0;
+		const bridge = {
+			getSession: (sessionId: string) =>
+				sessionId === "session-1"
+					? {
+							sessionId,
+							sessionFile: undefined,
+							cwd: "/workspace",
+							subscribe(listener: EventListener) {
+								sessionListeners.add(listener);
+								return () => sessionListeners.delete(listener);
+							},
+							snapshot: () => snapshot,
+							getHistory() {
+								return { messages: [], startIndex: 0 };
+							},
+						}
+					: undefined,
+			trackSubscriberAdded() {
+				added++;
+			},
+			trackSubscriberRemoved() {
+				removed++;
+			},
+			subscribeUiFrames(_sessionId: string, listener: (frame: unknown) => void) {
+				uiListeners.add(listener);
+				return () => uiListeners.delete(listener);
+			},
+			subscribePlanModeFrames(_sessionId: string, listener: (frame: unknown) => void) {
+				planListeners.add(listener);
+				return () => planListeners.delete(listener);
+			},
+			bumpActivity() {},
+		} as unknown as AgentBridge;
+		const hub = new WsHub(bridge, noopSkills);
+		const socket = makeSocket(hub);
+		try {
+			socket.sent.length = 0;
+			const first = hub.onMessage(
+				socket as unknown as ServerWebSocket<ConnectionData>,
+				JSON.stringify({ type: "subscribe", sessionId: "session-1" }),
+			);
+			const second = hub.onMessage(
+				socket as unknown as ServerWebSocket<ConnectionData>,
+				JSON.stringify({ type: "subscribe", sessionId: "session-1" }),
+			);
+
+			expect(socket.data.subscriptions.size).toBe(1);
+			expect(sessionListeners.size).toBe(1);
+			expect(uiListeners.size).toBe(1);
+			expect(planListeners.size).toBe(1);
+			expect(added).toBe(1);
+
+			resolveSnapshot({});
+			await Promise.all([first, second]);
+			hub.onClose(socket as unknown as ServerWebSocket<ConnectionData>);
+
+			expect(sessionListeners.size).toBe(0);
+			expect(uiListeners.size).toBe(0);
+			expect(planListeners.size).toBe(0);
+			expect(removed).toBe(1);
+		} finally {
+			hub.dispose();
+		}
+	});
+
+	test("cleans partial subscription listeners when snapshot setup rejects", async () => {
+		const sessionListeners = new Set<EventListener>();
+		const uiListeners = new Set<(frame: unknown) => void>();
+		const planListeners = new Set<(frame: unknown) => void>();
+		let removed = 0;
+		const bridge = {
+			getSession: () => ({
+				sessionId: "session-1",
+				sessionFile: undefined,
+				cwd: "/workspace",
+				subscribe(listener: EventListener) {
+					sessionListeners.add(listener);
+					return () => sessionListeners.delete(listener);
+				},
+				snapshot: () => Promise.reject(new Error("snapshot failed")),
+				getHistory() {
+					return { messages: [], startIndex: 0 };
+				},
+			}),
+			trackSubscriberAdded() {},
+			trackSubscriberRemoved() {
+				removed++;
+			},
+			subscribeUiFrames(_sessionId: string, listener: (frame: unknown) => void) {
+				uiListeners.add(listener);
+				return () => uiListeners.delete(listener);
+			},
+			subscribePlanModeFrames(_sessionId: string, listener: (frame: unknown) => void) {
+				planListeners.add(listener);
+				return () => planListeners.delete(listener);
+			},
+		} as unknown as AgentBridge;
+		const hub = new WsHub(bridge, noopSkills);
+		const socket = makeSocket(hub);
+		try {
+			socket.sent.length = 0;
+			await expect(
+				hub.onMessage(
+					socket as unknown as ServerWebSocket<ConnectionData>,
+					JSON.stringify({ type: "subscribe", sessionId: "session-1" }),
+				),
+			).resolves.toBeUndefined();
+
+			expect(socket.data.subscriptions.size).toBe(0);
+			expect(sessionListeners.size).toBe(0);
+			expect(uiListeners.size).toBe(0);
+			expect(planListeners.size).toBe(0);
+			expect(removed).toBe(1);
+			expect(frames(socket)).toEqual([{ type: "error", error: "message handling failed" }]);
+		} finally {
+			hub.onClose(socket as unknown as ServerWebSocket<ConnectionData>);
+			hub.dispose();
+		}
+	});
+
+	test("contains UI and plan frame send races", async () => {
+		const uiListeners = new Set<(frame: unknown) => void>();
+		const planListeners = new Set<(frame: unknown) => void>();
+		const bridge = {
+			getSession: () => ({
+				sessionId: "session-1",
+				sessionFile: undefined,
+				cwd: "/workspace",
+				subscribe() {
+					return () => {};
+				},
+				snapshot() {
+					return {};
+				},
+				getHistory() {
+					return { messages: [], startIndex: 0 };
+				},
+			}),
+			trackSubscriberAdded() {},
+			trackSubscriberRemoved() {},
+			subscribeUiFrames(_sessionId: string, listener: (frame: unknown) => void) {
+				uiListeners.add(listener);
+				return () => uiListeners.delete(listener);
+			},
+			subscribePlanModeFrames(_sessionId: string, listener: (frame: unknown) => void) {
+				planListeners.add(listener);
+				return () => planListeners.delete(listener);
+			},
+		} as unknown as AgentBridge;
+		const hub = new WsHub(bridge, noopSkills);
+		const socket = makeSocket(hub);
+		try {
+			await hub.onMessage(
+				socket as unknown as ServerWebSocket<ConnectionData>,
+				JSON.stringify({ type: "subscribe", sessionId: "session-1" }),
+			);
+			socket.send = () => {
+				throw new Error("socket closed");
+			};
+
+			expect(() => {
+				for (const listener of uiListeners) {
+					listener({
+						type: "ext_ui_dialog_cancel",
+						sessionId: "session-1",
+						dialogId: "dialog-1",
+						reason: "aborted",
+					});
+				}
+				for (const listener of planListeners) {
+					listener({ type: "plan_mode_changed", sessionId: "session-1", enabled: true, planFilePath: "local://PLAN.md" });
+				}
+			}).not.toThrow();
+		} finally {
+			hub.onClose(socket as unknown as ServerWebSocket<ConnectionData>);
+			hub.dispose();
+		}
+	});
+
+	test("detaches its broadcast-bus listener when disposed", () => {
+		const { bridge } = fakeBridge();
+		const hub = new WsHub(bridge, noopSkills);
+		const socket = makeSocket(hub);
+		socket.sent.length = 0;
+
+		hub.dispose();
+		broadcastBus.broadcast({ type: "models_changed" });
+
+		expect(frames(socket)).toEqual([]);
+		hub.onClose(socket as unknown as ServerWebSocket<ConnectionData>);
+	});
+});

@@ -2,10 +2,9 @@ import type { ImageAttachment } from "@omp-deck/protocol";
 
 import { loadTelegramBridgeConfig, type TelegramBridgeConfig } from "./config.ts";
 import { DeckClient, SessionNotActiveError } from "./deck.ts";
+import { sendFinalReply } from "./reply.ts";
 import { nowIso, TelegramBridgeStore, type ChatSessionMapping } from "./store.ts";
 import { TelegramApi, type TelegramMessage, type TelegramPhotoSize, type TelegramUpdate } from "./telegram.ts";
-
-const TELEGRAM_TEXT_LIMIT = 3900;
 
 class TelegramBridge {
 	private readonly telegram: TelegramApi;
@@ -87,15 +86,13 @@ class TelegramBridge {
 		const images = await this.downloadImages(photos);
 		const prompt = text || "Please analyze this image.";
 		let mapping = await this.ensureMapping(String(message.chat.id));
-		const reply = new TelegramReply(this.telegram, message.chat.id, message.message_id, this.config.editIntervalMs);
 		try {
 			const finalText = await this.deck.promptSession({
 				sessionId: mapping.sessionId,
 				text: prompt,
 				...(images.length > 0 ? { images } : {}),
-				onText: (next) => reply.update(next),
 			});
-			await reply.finish(finalText);
+			await sendFinalReply(this.telegram, message.chat.id, message.message_id, finalText);
 		} catch (err) {
 			if (err instanceof SessionNotActiveError) {
 				mapping = await this.resumeOrReplaceMapping(mapping);
@@ -103,12 +100,11 @@ class TelegramBridge {
 					sessionId: mapping.sessionId,
 					text: prompt,
 					...(images.length > 0 ? { images } : {}),
-					onText: (next) => reply.update(next),
 				});
-				await reply.finish(finalText);
+				await sendFinalReply(this.telegram, message.chat.id, message.message_id, finalText);
 				return;
 			}
-			await reply.finish(`Bridge error: ${String(err)}`);
+			await sendFinalReply(this.telegram, message.chat.id, message.message_id, `Bridge error: ${String(err)}`);
 		}
 	}
 
@@ -166,88 +162,6 @@ class TelegramBridge {
 		const image = await this.telegram.downloadPhoto(largest);
 		return [{ type: "image", data: image.data, mimeType: image.mimeType }];
 	}
-}
-
-class TelegramReply {
-	private sent: Promise<{ message_id: number }> | undefined;
-	private latest = "";
-	private rendered = "";
-	private timer: ReturnType<typeof setTimeout> | undefined;
-	private chain: Promise<void> = Promise.resolve();
-
-	constructor(
-		private readonly telegram: TelegramApi,
-		private readonly chatId: number,
-		private readonly replyToMessageId: number,
-		private readonly editIntervalMs: number,
-	) {}
-
-	update(text: string): void {
-		this.latest = text;
-		if (this.timer) return;
-		this.timer = setTimeout(() => {
-			this.timer = undefined;
-			this.enqueueFlush();
-		}, this.editIntervalMs);
-	}
-
-	async finish(text: string): Promise<void> {
-		this.latest = text || this.latest || "Turn complete.";
-		if (this.timer) {
-			clearTimeout(this.timer);
-			this.timer = undefined;
-		}
-		await this.chain;
-		const chunks = splitTelegramText(this.latest);
-		await this.editRendered(chunks[0]!);
-		for (const chunk of chunks.slice(1)) await this.telegram.sendMessage(this.chatId, chunk);
-	}
-
-	private enqueueFlush(): Promise<void> {
-		this.chain = this.chain.then(() => this.flush()).catch((err) => console.warn("telegram reply edit failed", err));
-		return this.chain;
-	}
-
-	private async flush(): Promise<void> {
-		const next = truncateTelegramText(this.latest || "Working...");
-		if (next === this.rendered) return;
-		await this.editRendered(next);
-	}
-
-	private async editRendered(text: string): Promise<void> {
-		if (text === this.rendered) return;
-		const sent = await this.ensureSent();
-		try {
-			await this.telegram.editMessageText(this.chatId, sent.message_id, text);
-			this.rendered = text;
-		} catch (err) {
-			if (!String(err).includes("message is not modified")) throw err;
-		}
-	}
-
-	private ensureSent(): Promise<{ message_id: number }> {
-		this.sent ??= this.telegram.sendMessage(this.chatId, "Working...", this.replyToMessageId);
-		return this.sent;
-	}
-}
-
-function splitTelegramText(text: string): string[] {
-	const trimmed = text.trim() || "Turn complete.";
-	const chunks: string[] = [];
-	let rest = trimmed;
-	while (rest.length > TELEGRAM_TEXT_LIMIT) {
-		let cut = rest.lastIndexOf("\n", TELEGRAM_TEXT_LIMIT);
-		if (cut < TELEGRAM_TEXT_LIMIT * 0.6) cut = TELEGRAM_TEXT_LIMIT;
-		chunks.push(rest.slice(0, cut).trimEnd());
-		rest = rest.slice(cut).trimStart();
-	}
-	chunks.push(rest);
-	return chunks;
-}
-
-function truncateTelegramText(text: string): string {
-	const chunks = splitTelegramText(text);
-	return chunks.length === 1 ? chunks[0]! : `${chunks[0]!}\n\n...`;
 }
 
 function sleep(ms: number): Promise<void> {

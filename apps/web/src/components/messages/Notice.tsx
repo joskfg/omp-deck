@@ -17,6 +17,9 @@ export function Notice({ msg }: { msg: NoticeMsg }) {
 				</span>
 			) : null}
 			<span className="text-ink-2">{msg.message}</span>
+			{msg.body ? (
+				<div className="mt-0.5 whitespace-pre-wrap text-[12px] text-ink-3">{msg.body}</div>
+			) : null}
 		</div>
 	);
 }

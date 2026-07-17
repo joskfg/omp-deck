@@ -10,6 +10,7 @@ import {
 	FileText,
 	Folder,
 	FolderOpen,
+	FolderPlus,
 	Link2,
 	Link2Off,
 	Loader2,
@@ -32,6 +33,7 @@ import { useStore } from "@/lib/store";
 import { cn } from "@/lib/utils";
 import { KbGraphPane } from "./KbGraphPane";
 import { KbCommandPalette } from "./KbCommandPalette";
+import { KbCreateModal } from "./KbCreateModal";
 
 /**
  * /kb — Karpathy-style llm-wiki viewer. Sidebar = tree; main = markdown
@@ -122,7 +124,7 @@ export function KbView() {
 	return (
 		<>
 		<Layout
-			sidebar={<KbSidebar />}
+			sidebar={<KbSidebar root={status?.root ?? "~/kb"} />}
 			inspector={
 				<KbInspector
 					currentPath={currentPath}
@@ -192,6 +194,7 @@ export function KbView() {
 										{currentPath ? (
 											<KbFilePane
 												path={currentPath}
+												root={status?.root ?? "~/kb"}
 												onNavigate={(p) => {
 													const next = new URLSearchParams(params);
 													next.set("path", p);
@@ -237,9 +240,9 @@ export function KbView() {
 										)}
 									>
 										{currentPath ? (
-											<KbFilePane path={currentPath} onNavigate={(p) => setCurrentPath(p)} kbChangeCounter={kbChangeCounter} />
+											<KbFilePane path={currentPath} root={status?.root ?? "~/kb"} onNavigate={(p) => setCurrentPath(p)} kbChangeCounter={kbChangeCounter} />
 										) : (
-											<KbEmpty />
+											<KbEmpty root={status?.root ?? "~/kb"} />
 										)}
 									</div>
 								</div>
@@ -324,13 +327,13 @@ function KbTopBar({
 	);
 }
 
-function KbEmpty() {
+function KbEmpty({ root }: { root: string }) {
 	return (
 		<div className="flex h-full flex-col items-center justify-center px-6 py-10 text-center">
 			<BookOpen className="h-6 w-6 text-ink-4" />
 			<div className="mt-3 text-sm text-ink-2">Pick a file from the tree.</div>
 			<div className="mt-1 max-w-sm text-xs text-ink-3">
-				The KB cockpit reads your wiki at <span className="font-mono text-ink-2">~/kb</span>. Set{" "}
+				The KB cockpit reads your wiki at <span className="font-mono text-ink-2">{root}</span>. Set{" "}
 				<span className="font-mono">OMP_DECK_KB_EXCLUDE_DIRS</span> to hide subtrees if you need to.
 			</div>
 		</div>
@@ -427,7 +430,7 @@ function KbWelcome({
 
 // ─── Tree ────────────────────────────────────────────────────────────────
 
-function KbSidebar() {
+function KbSidebar({ root }: { root: string }) {
 	return (
 		<div className="flex h-full min-h-0 flex-col">
 			<div className="border-b border-line px-3 py-2">
@@ -437,7 +440,7 @@ function KbSidebar() {
 				</div>
 			</div>
 			<div className="min-h-0 flex-1 px-3 py-2 text-xs text-ink-3">
-				The cockpit reads <span className="font-mono">~/kb</span> via{" "}
+				The cockpit reads <span className="font-mono">{root}</span> via{" "}
 				<span className="font-mono">OMP_DECK_KB_ROOT</span>. Hide subtrees via{" "}
 				<span className="font-mono">OMP_DECK_KB_EXCLUDE_DIRS</span>.
 			</div>
@@ -456,6 +459,11 @@ function KbTree({
 	onOpenSearch: () => void;
 	kbChangeCounter: number;
 }) {
+	const [createTarget, setCreateTarget] = useState<{ kind: "file" | "folder"; parentPath: string } | null>(null);
+	const requestCreate = useCallback((kind: "file" | "folder", parentPath: string) => {
+		setCreateTarget({ kind, parentPath });
+	}, []);
+
 	return (
 		<div className="flex h-full min-h-0 flex-col">
 			<div className="border-b border-line px-3 py-2">
@@ -463,10 +471,28 @@ function KbTree({
 					<div className="meta">Knowledge</div>
 					<button
 						type="button"
+						onClick={() => requestCreate("file", "")}
+						aria-label="New file at kb root"
+						title="New file"
+						className="ml-auto inline-flex h-7 w-7 items-center justify-center rounded-md border border-line bg-paper-2 text-ink-3 transition-colors hover:bg-paper-3 hover:text-ink"
+					>
+						<FilePlus className="h-3.5 w-3.5" />
+					</button>
+					<button
+						type="button"
+						onClick={() => requestCreate("folder", "")}
+						aria-label="New folder at kb root"
+						title="New folder"
+						className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-line bg-paper-2 text-ink-3 transition-colors hover:bg-paper-3 hover:text-ink"
+					>
+						<FolderPlus className="h-3.5 w-3.5" />
+					</button>
+					<button
+						type="button"
 						onClick={onOpenSearch}
 						aria-label="Search KB (Ctrl-P)"
 						title="Search (Ctrl-P / ⌘P)"
-						className="ml-auto inline-flex h-7 items-center gap-1 rounded-md border border-line bg-paper-2 px-2 text-2xs text-ink-3 transition-colors hover:bg-paper-3 hover:text-ink"
+						className="inline-flex h-7 items-center gap-1 rounded-md border border-line bg-paper-2 px-2 text-2xs text-ink-3 transition-colors hover:bg-paper-3 hover:text-ink"
 					>
 						<Search className="h-3 w-3" />
 						<span className="font-mono">Ctrl-P</span>
@@ -477,8 +503,29 @@ function KbTree({
 				</div>
 			</div>
 			<div className="min-h-0 flex-1 overflow-y-auto py-1">
-				<TreeBranch path="" depth={0} expanded openOnMount currentPath={currentPath} onSelect={onSelect} kbChangeCounter={kbChangeCounter} />
+				<TreeBranch
+					path=""
+					depth={0}
+					expanded
+					openOnMount
+					currentPath={currentPath}
+					onSelect={onSelect}
+					kbChangeCounter={kbChangeCounter}
+					onRequestCreate={requestCreate}
+				/>
 			</div>
+			<KbCreateModal
+				open={createTarget !== null}
+				kind={createTarget?.kind ?? "file"}
+				parentPath={createTarget?.parentPath ?? ""}
+				onClose={() => setCreateTarget(null)}
+				onCreated={(createdPath) => {
+					const wasFile = createTarget?.kind === "file";
+					setCreateTarget(null);
+					useStore.setState((s) => ({ kbChangeCounter: s.kbChangeCounter + 1 }));
+					if (wasFile) onSelect(createdPath);
+				}}
+			/>
 		</div>
 	);
 }
@@ -491,6 +538,7 @@ function TreeBranch({
 	currentPath,
 	onSelect,
 	kbChangeCounter,
+	onRequestCreate,
 }: {
 	path: string;
 	depth: number;
@@ -499,6 +547,7 @@ function TreeBranch({
 	currentPath: string | undefined;
 	onSelect: (p: string) => void;
 	kbChangeCounter: number;
+	onRequestCreate: (kind: "file" | "folder", parentPath: string) => void;
 }) {
 	const [expanded, setExpanded] = useState(expandedDefault);
 	const [data, setData] = useState<KbTreeResponse | null>(null);
@@ -539,6 +588,7 @@ function TreeBranch({
 							currentPath={currentPath}
 							onSelect={onSelect}
 							kbChangeCounter={kbChangeCounter}
+							onRequestCreate={onRequestCreate}
 						/>
 					))}
 					{data.files.map((f) => (
@@ -564,36 +614,74 @@ function TreeDir({
 	currentPath,
 	onSelect,
 	kbChangeCounter,
+	onRequestCreate,
 }: {
 	entry: KbTreeEntry;
 	depth: number;
 	currentPath: string | undefined;
 	onSelect: (p: string) => void;
 	kbChangeCounter: number;
+	onRequestCreate: (kind: "file" | "folder", parentPath: string) => void;
 }) {
 	const [expanded, setExpanded] = useState(false);
 	const Chevron = expanded ? ChevronDown : ChevronRight;
 	const FolderIcon = expanded ? FolderOpen : Folder;
+
+	// Clicking a create action also opens the dir — the new node lands
+	// inside it, so the row should already be showing its children.
+	const createHere = useCallback(
+		(kind: "file" | "folder") => {
+			setExpanded(true);
+			onRequestCreate(kind, entry.path);
+		},
+		[entry.path, onRequestCreate],
+	);
+
 	return (
 		<div>
-			<button
-				type="button"
-				onClick={() => setExpanded((x) => !x)}
-				className={cn(
-					"flex w-full items-center gap-1 px-2 py-1 text-left text-sm transition-colors hover:bg-paper-3",
-				)}
-				style={{ paddingLeft: 8 + depth * 12 }}
-			>
-				<Chevron className="h-3 w-3 shrink-0 text-ink-3" />
-				<FolderIcon className="h-3.5 w-3.5 shrink-0 text-ink-3" />
-				<span className="min-w-0 truncate text-ink-2">{entry.name}</span>
-				{entry.symlink ? (
-					<span className="font-mono text-2xs uppercase text-ink-4" title="symlink/junction">→</span>
-				) : null}
+			<div className="group flex items-center gap-0.5 pr-1 hover:bg-paper-3" style={{ paddingLeft: 8 + depth * 12 }}>
+				<button
+					type="button"
+					onClick={() => setExpanded((x) => !x)}
+					className="flex min-w-0 flex-1 items-center gap-1 py-1 text-left text-sm"
+				>
+					<Chevron className="h-3 w-3 shrink-0 text-ink-3" />
+					<FolderIcon className="h-3.5 w-3.5 shrink-0 text-ink-3" />
+					<span className="min-w-0 truncate text-ink-2">{entry.name}</span>
+					{entry.symlink ? (
+						<span className="font-mono text-2xs uppercase text-ink-4" title="symlink/junction">→</span>
+					) : null}
+				</button>
+				<span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
+					<button
+						type="button"
+						onClick={(e) => {
+							e.stopPropagation();
+							createHere("file");
+						}}
+						className="rounded p-0.5 text-ink-4 hover:bg-paper-2 hover:text-ink"
+						title={`New file in ${entry.name}`}
+						aria-label={`New file in ${entry.name}`}
+					>
+						<FilePlus className="h-3.5 w-3.5" />
+					</button>
+					<button
+						type="button"
+						onClick={(e) => {
+							e.stopPropagation();
+							createHere("folder");
+						}}
+						className="rounded p-0.5 text-ink-4 hover:bg-paper-2 hover:text-ink"
+						title={`New folder in ${entry.name}`}
+						aria-label={`New folder in ${entry.name}`}
+					>
+						<FolderPlus className="h-3.5 w-3.5" />
+					</button>
+				</span>
 				{typeof entry.mdCount === "number" ? (
-					<span className="ml-auto font-mono text-2xs text-ink-4">{entry.mdCount}</span>
+					<span className="shrink-0 font-mono text-2xs text-ink-4">{entry.mdCount}</span>
 				) : null}
-			</button>
+			</div>
 			{expanded ? (
 				<TreeBranch
 					path={entry.path}
@@ -602,6 +690,7 @@ function TreeDir({
 					currentPath={currentPath}
 					onSelect={onSelect}
 					kbChangeCounter={kbChangeCounter}
+					onRequestCreate={onRequestCreate}
 				/>
 			) : null}
 		</div>
@@ -642,11 +731,13 @@ function KbFilePane({
 	onNavigate,
 	onClose,
 	kbChangeCounter,
+	root,
 }: {
 	path: string;
 	onNavigate: (p: string) => void;
 	onClose?: () => void;
 	kbChangeCounter: number;
+	root: string;
 }) {
 	const [file, setFile] = useState<KbFileResponse | null>(null);
 	const [loading, setLoading] = useState(true);
@@ -764,7 +855,7 @@ function KbFilePane({
 			</div>
 		);
 	}
-	if (!file) return <KbEmpty />;
+	if (!file) return <KbEmpty root={root} />;
 
 	return (
 		<div className="flex h-full flex-col">

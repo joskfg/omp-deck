@@ -1,9 +1,10 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { NavRail } from "./NavRail";
 import { Eye, EyeOff, FoldVertical, ListTodo, Menu, PanelRight, UnfoldVertical, X } from "lucide-react";
 import { useStore } from "@/lib/store";
 import { cn } from "@/lib/utils";
 import { ConnectionIndicator } from "./ConnectionIndicator";
+import { api } from "@/lib/api";
 
 interface Props {
 	sidebar: ReactNode;
@@ -17,6 +18,23 @@ export function Layout({ sidebar, main, inspector, topBar }: Props) {
 	const setSidebarOpen = useStore((s) => s.setSidebarOpen);
 	const inspectorOpen = useStore((s) => s.inspectorOpen);
 	const setInspectorOpen = useStore((s) => s.setInspectorOpen);
+
+	const [title, setTitle] = useState("omp-deck");
+
+	useEffect(() => {
+		let disposed = false;
+		void api
+			.getAppTitle()
+			.then(({ title: nextTitle }) => {
+				if (!disposed) setTitle(nextTitle);
+			})
+			.catch(() => {
+				// Keep the default title when the server cannot be reached.
+			});
+		return () => {
+			disposed = true;
+		};
+	}, []);
 
 	// Esc closes both overlays on small screens.
 	useEffect(() => {
@@ -47,7 +65,13 @@ export function Layout({ sidebar, main, inspector, topBar }: Props) {
 					<Menu className="h-4 w-4" />
 				</button>
 				<div className="font-mono text-[13px] font-medium tracking-tight text-ink">
-					omp<span className="text-ink-3">·</span>deck
+					{title === "omp-deck" ? (
+						<>
+							omp<span className="text-ink-3">·</span>deck
+						</>
+					) : (
+						title
+					)}
 				</div>
 				<div className="ml-auto flex min-w-0 items-center gap-2 overflow-hidden">
 					<div className="hidden min-w-0 truncate sm:block">{topBar}</div>

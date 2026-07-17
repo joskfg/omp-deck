@@ -1,6 +1,6 @@
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Zap } from "lucide-react";
+import { FolderOpen, Zap } from "lucide-react";
 import type { Task, TaskPriority } from "@omp-deck/protocol";
 import { formatBriefTime } from "@/lib/time";
 import { cn, truncate } from "@/lib/utils";
@@ -19,6 +19,7 @@ const PRIORITY_TONE: Record<TaskPriority, string> = {
 interface Props {
 	task: Task;
 	onOpen: (task: Task) => void;
+	onPickCwd?: (task: Task) => void;
 	projectColor?: string;
 }
 
@@ -28,7 +29,7 @@ interface Props {
  * will land; the lifted card itself is rendered by the DragOverlay in
  * TasksView. The two modes share `<TaskCardBody>` so the visual is identical.
  */
-export function TaskCard({ task, onOpen, projectColor }: Props) {
+export function TaskCard({ task, onOpen, onPickCwd, projectColor }: Props) {
 	const {
 		attributes,
 		listeners,
@@ -78,9 +79,25 @@ export function TaskCard({ task, onOpen, projectColor }: Props) {
 			}}
 			role="button"
 			tabIndex={0}
-			className="group"
+			className="group relative"
 		>
 			<TaskCardBody task={task} lifted={false} projectColor={projectColor} />
+			{onPickCwd ? (
+				<button
+					type="button"
+					aria-label="Change workspace folder"
+					className="absolute bottom-1.5 right-1.5 rounded p-0.5 text-ink-4 opacity-0 transition-opacity hover:text-ink group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ink/40"
+					onPointerDown={(e) => e.stopPropagation()}
+					onKeyDown={(e) => e.stopPropagation()}
+					onClick={(e) => {
+						e.preventDefault();
+						e.stopPropagation();
+						onPickCwd(task);
+					}}
+				>
+					<FolderOpen className="h-3 w-3" />
+				</button>
+			) : null}
 		</div>
 	);
 }

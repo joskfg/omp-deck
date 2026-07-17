@@ -2,14 +2,11 @@ import { Layout } from "@/components/Layout";
 import { ExternalLink, Plug } from "lucide-react";
 
 /**
- * /integrations — stub for V1.5 MCP server management UI.
+ * /integrations — MCP server overview.
  *
- * V1 routines can already invoke MCP tools via the `agent` step's
- * `mcp_servers_allowed` field once the user has installed an MCP server
- * through the chat's `/mcp install` command. The dedicated install UI lands
- * in V1.5; this view documents the path in the meantime.
- *
- * See `omp-deck/docs/proposals/routines-v1-plan.md` §5 for the design.
+ * The built-in codebase-memory-mcp server is discovered for every session.
+ * Project-level activation is managed from Project Configuration. The
+ * remaining curated server catalog is still planned for V1.5.
  */
 export function IntegrationsView() {
 	return (
@@ -18,7 +15,8 @@ export function IntegrationsView() {
 				<div className="p-3">
 					<div className="meta mb-2">Integrations</div>
 					<div className="text-sm text-ink-3">
-						V1.5 will surface installed MCP servers and one-click Workspace setup.
+						Codebase Memory MCP is included by default. Manage its project-level
+						toggle from Project Configuration.
 					</div>
 				</div>
 			}
@@ -26,12 +24,23 @@ export function IntegrationsView() {
 				<div className="flex h-full min-h-0 flex-col">
 					<div className="flex h-11 shrink-0 items-center gap-2 border-b border-line bg-paper px-3">
 						<div className="meta">Integrations</div>
-						<span className="rounded border border-accent/40 bg-accent/10 px-1.5 py-0.5 font-mono text-2xs uppercase tracking-meta text-accent">
-							V1.5
+						<span className="rounded border border-success/40 bg-success/10 px-1.5 py-0.5 font-mono text-2xs uppercase tracking-meta text-success">
+							Built-in
 						</span>
 					</div>
 					<div className="flex flex-1 items-center justify-center px-6 py-8">
 						<div className="max-w-2xl space-y-4">
+							<div className="rounded border border-line bg-paper-2 p-3">
+								<div className="flex items-center justify-between gap-3">
+									<div>
+										<div className="font-medium text-ink">codebase-memory-mcp</div>
+										<div className="mt-1 text-xs text-ink-3">
+											Built-in code intelligence server, enabled by default per project.
+										</div>
+									</div>
+									<span className="font-mono text-2xs text-success">available</span>
+								</div>
+							</div>
 							<div className="flex items-center gap-2">
 								<Plug className="h-5 w-5 text-accent" />
 								<h2 className="text-lg font-medium text-ink">Coming in V1.5</h2>

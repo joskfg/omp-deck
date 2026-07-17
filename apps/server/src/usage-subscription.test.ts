@@ -186,6 +186,88 @@ describe("fetchSubscriptionUsage", () => {
 		expect(Date.parse(result.weeklyResetAt)).toBeGreaterThanOrEqual(before + FIVE_HOURS_MS);
 		expect(Date.parse(result.limits[0]!.resetAt)).toBeGreaterThanOrEqual(before + FIVE_HOURS_MS);
 	});
+
+	test("same limit.id from different accountIds produces separate limits entries", async () => {
+		// Regression: the old allById Map was keyed only by limit.id, so two
+		// accounts' "5h" windows collapsed to one bar. Now keyed by
+		// provider:account:limitId, each account must produce its own entry.
+		const reportA: UsageReport = {
+			provider: "anthropic",
+			fetchedAt: Date.now(),
+			limits: [
+				{
+					id: "5h",
+					label: "5 Hour",
+					scope: { provider: "anthropic", accountId: "acc_111" },
+					amount: { usedFraction: 0.3, unit: "percent" },
+					window: { id: "5h", label: "5 Hour", durationMs: FIVE_HOURS_MS },
+				},
+			],
+		};
+		const reportB: UsageReport = {
+			provider: "anthropic",
+			fetchedAt: Date.now(),
+			limits: [
+				{
+					id: "5h",
+					label: "5 Hour",
+					scope: { provider: "anthropic", accountId: "acc_222" },
+					amount: { usedFraction: 0.7, unit: "percent" },
+					window: { id: "5h", label: "5 Hour", durationMs: FIVE_HOURS_MS },
+				},
+			],
+		};
+		const result = await fetchSubscriptionUsage(fetcher([reportA, reportB]));
+		expect(result.available).toBe(true);
+		if (!result.available) return;
+		// Both accounts must appear as distinct bars.
+		expect(result.limits).toHaveLength(2);
+		const accounts = result.limits.map((l) => l.account).sort();
+		expect(accounts).toEqual(["acc_111", "acc_222"]);
+		// session/weekly still uses the primary-provider byId dedup (highest fraction).
+		expect(result.sessionPct).toBeCloseTo(70, 5);
+	});
+
+	test("provider and account fields are carried through to each limit entry", async () => {
+		const report: UsageReport = {
+			provider: "anthropic",
+			fetchedAt: Date.now(),
+			limits: [
+				{
+					id: "5h",
+					label: "5 Hour",
+					scope: { provider: "anthropic", accountId: "acc_abc" },
+					amount: { usedFraction: 0.5, unit: "percent" },
+					window: { id: "5h", label: "5 Hour", durationMs: FIVE_HOURS_MS },
+				},
+			],
+		};
+		const result = await fetchSubscriptionUsage(fetcher([report]));
+		expect(result.available).toBe(true);
+		if (!result.available) return;
+		expect(result.limits).toHaveLength(1);
+		expect(result.limits[0]).toMatchObject({ provider: "anthropic", account: "acc_abc" });
+	});
+
+	test("falls back through orgId then projectId then tier then (shared) for account label", async () => {
+		const makeScoped = (scope: UsageReport["limits"][number]["scope"]): UsageReport => ({
+			provider: "anthropic",
+			fetchedAt: Date.now(),
+			limits: [{ id: "5h", label: "5 Hour", scope, amount: { usedFraction: 0.1, unit: "percent" }, window: { id: "5h", label: "5 Hour", durationMs: FIVE_HOURS_MS } }],
+		});
+		// orgId wins when accountId absent
+		const r1 = await fetchSubscriptionUsage(fetcher([makeScoped({ provider: "anthropic", orgId: "org_x" })]));
+		expect(r1.available && r1.limits[0]?.account).toBe("org_x");
+		// projectId wins when accountId+orgId absent
+		const r2 = await fetchSubscriptionUsage(fetcher([makeScoped({ provider: "anthropic", projectId: "proj_y" })]));
+		expect(r2.available && r2.limits[0]?.account).toBe("proj_y");
+		// tier wins when all above absent
+		const r3 = await fetchSubscriptionUsage(fetcher([makeScoped({ provider: "anthropic", tier: "pro" })]));
+		expect(r3.available && r3.limits[0]?.account).toBe("pro");
+		// (shared) when none present
+		const r4 = await fetchSubscriptionUsage(fetcher([makeScoped({ provider: "anthropic" })]));
+		expect(r4.available && r4.limits[0]?.account).toBe("(shared)");
+	});
 });
 
 // ---------------------------------------------------------------------------

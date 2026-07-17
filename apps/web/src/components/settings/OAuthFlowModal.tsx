@@ -87,6 +87,7 @@ export function OAuthFlowModal({ open, provider, providerName, onClose, onComple
 	// Subscribe to WS frames for THIS flow.
 	useEffect(() => {
 		if (!open || !ws || !flowId) return;
+		let completionTimer: number | undefined;
 		const unsub = ws.subscribe((frame: ServerFrame) => {
 			if (!("flowId" in frame) || frame.flowId !== flowId) return;
 			switch (frame.type) {
@@ -110,7 +111,8 @@ export function OAuthFlowModal({ open, provider, providerName, onClose, onComple
 				case "oauth_complete":
 					setPhase("complete");
 					// Brief success state, then close.
-					setTimeout(() => onComplete(), 1200);
+					if (completionTimer !== undefined) window.clearTimeout(completionTimer);
+					completionTimer = window.setTimeout(onComplete, 1200);
 					return;
 				case "oauth_failed":
 					setErrorMessage(frame.message);
@@ -118,7 +120,10 @@ export function OAuthFlowModal({ open, provider, providerName, onClose, onComple
 					return;
 			}
 		});
-		return unsub;
+		return () => {
+			unsub();
+			if (completionTimer !== undefined) window.clearTimeout(completionTimer);
+		};
 	}, [open, ws, flowId, onComplete]);
 
 	function closeAndCancel(): void {

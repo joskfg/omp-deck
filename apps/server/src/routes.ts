@@ -1,8 +1,10 @@
 import { Hono } from "hono";
 import type {
+	AddWorkspaceRequest,
 	AgentMessageJson,
 	CreateSessionRequest,
 	CreateSessionResponse,
+	GetSessionHandoffSuccessorResponse,
 	ListModelsResponse,
 	ListSessionsResponse,
 	ListSessionMonitorResponse,
@@ -13,10 +15,14 @@ import type {
 	RewriteTaskRequest,
 	RewriteTaskResponse,
 	SessionHistoryResponse,
+	BranchSessionRequest,
+	SessionTreeResponse,
 	SetWorkspacePreferenceRequest,
 	WorkspaceEntry,
 } from "@omp-deck/protocol";
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { Config } from "./config.ts";
 import { logger } from "./log.ts";
 import { broadcastBus } from "./broadcast-bus.ts";
@@ -25,25 +31,27 @@ import { getUpdateCheck } from "./update-check.ts";
 import type { AgentBridge, SessionHandle } from "./bridge/types.ts";
 import { getWorkspacePreference, listWorkspacePreferences, setWorkspacePreference } from "./db/workspace-preferences.ts";
 import { getTask } from "./db/tasks.ts";
-import { getTaskRewriteModel } from "./db/server-settings.ts";
+import { getTaskRewriteModel, getExtraWorkspaces, setExtraWorkspaces, getHiddenWorkspaces, setHiddenWorkspaces } from "./db/server-settings.ts";
 import { resolveIntegrationPrompt } from "./integration-prompts.ts";
 import { waitForAutoWorkSessionTerminal } from "./auto-work/engine.ts";
 import { getModelCatalogOverlay } from "./model-catalog-overlay.ts";
 import { listSessionMonitor } from "./session-monitor.ts";
+import { findHandoffSuccessor } from "./bridge/session-handoff.ts";
 import { deriveLabel } from "./workspace-label.ts";
 
 const log = logger("routes");
 
 import { buildTasksRouter } from "./routes-tasks.ts";
-import { buildSettingsRouter } from "./routes-settings.ts";
+import { buildSettingsRouter, syncWorkspacesToEnv } from "./routes-settings.ts";
 import { buildDelegationRouter } from "./routes-delegation.ts";
+import { buildPoliciesRouter } from "./routes-policies.ts";
 import { buildAdvisorsRouter } from "./routes-advisors.ts";
 import { buildRoutinesRouter } from "./routes-routines.ts";
 import { buildHooksRouter } from "./routes-hooks.ts";
 import { buildInboxRouter } from "./routes-inbox.ts";
 import { buildUtilityRouter } from "./routes-cron.ts";
 import { buildSlashCommandsRouter } from "./routes-slash-commands.ts";
-import { buildFsRouter, isCwdAllowed } from "./routes-fs.ts";
+import { buildFsRouter, cwdNotAllowedMessage, isCwdAllowed } from "./routes-fs.ts";
 import { buildBridgesRouter } from "./routes-bridges.ts";
 import { buildMarketplaceRouter } from "./routes-marketplace.ts";
 import { buildSkillsRouter } from "./routes-skills.ts";
@@ -53,6 +61,10 @@ import { buildOrientationRouter } from "./routes-orientation.ts";
 import { buildAuthOAuthRouter } from "./routes-auth-oauth.ts";
 import { buildOnboardingRouter } from "./routes-onboarding.ts";
 import { buildUsageRouter } from "./routes-usage.ts";
+import { buildCodebaseMemoryRouter } from "./routes-codebase-memory.ts";
+import { buildMemoryRouter } from "./routes-memory.ts";
+import { buildGovernanceRouter } from "./routes-governance.ts";
+
 import { buildAutoWorkRouter } from "./routes-auto-work.ts";
 import type { RoutinesRunner } from "./routines-runner.ts";
 import type { BridgeSupervisor } from "./bridge-supervisor.ts";
@@ -78,6 +90,7 @@ export function buildRouter(
 			ok: true,
 			pid: info.pid,
 			defaultCwd: config.defaultCwd,
+			title: config.title,
 			extraWorkspaces: config.extraWorkspaces,
 			serverStartedAt: info.serverStartedAt,
 			version: info.version,
@@ -100,9 +113,17 @@ export function buildRouter(
 			counts.set(s.cwd, (counts.get(s.cwd) ?? 0) + 1);
 		}
 
-		// Always include default + extras even if zero sessions.
-		const known = new Set<string>([config.defaultCwd, ...config.extraWorkspaces]);
+		const hiddenSet = new Set(getHiddenWorkspaces());
+		const dbExtras = getExtraWorkspaces();
+
+		// Always include default + env extras + DB-registered extras.
+		const known = new Set<string>([config.defaultCwd, ...config.extraWorkspaces, ...dbExtras]);
 		for (const cwd of counts.keys()) known.add(cwd);
+
+		// Filter hidden (defaultCwd is never filtered).
+		for (const cwd of hiddenSet) {
+			if (cwd !== config.defaultCwd) known.delete(cwd);
+		}
 
 		const preferenceByCwd = new Map(listWorkspacePreferences().map((p) => [p.cwd, p]));
 
@@ -127,6 +148,71 @@ export function buildRouter(
 		return c.json(body);
 	});
 
+	app.post("/workspaces", async (c) => {
+		let body: AddWorkspaceRequest;
+		try {
+			body = (await c.req.json()) as AddWorkspaceRequest;
+		} catch {
+			return c.json({ error: "invalid json body" }, 400);
+		}
+		const cwd = body.cwd?.trim();
+		if (!cwd || !path.isAbsolute(cwd))
+			return c.json({ error: "cwd must be a non-empty absolute path" }, 400);
+		const resolved = path.resolve(cwd);
+
+		// Must be an existing directory under an allowed root.
+		try {
+			if (!fs.statSync(resolved).isDirectory())
+				return c.json({ error: "cwd must be a directory" }, 400);
+		} catch {
+			return c.json({ error: "cwd does not exist" }, 400);
+		}
+		if (!isCwdAllowed(resolved))
+			return c.json({ error: cwdNotAllowedMessage() }, 400);
+
+		// Register in DB.
+		const extras = getExtraWorkspaces();
+		if (!extras.includes(resolved)) setExtraWorkspaces([...extras, resolved]);
+
+		// Un-hide if it was previously hidden.
+		const hidden = getHiddenWorkspaces();
+		if (hidden.includes(resolved)) setHiddenWorkspaces(hidden.filter((h) => h !== resolved));
+
+		// Best-effort env sync — skips silently when OMP_DECK_WORKSPACES is shell-set.
+		if (!config.extraWorkspaces.includes(resolved)) {
+			await syncWorkspacesToEnv([...config.extraWorkspaces, resolved], config);
+		}
+
+		return c.json({ ok: true });
+	});
+
+	app.delete("/workspaces", async (c) => {
+		const cwd = c.req.query("cwd")?.trim();
+		if (!cwd) return c.json({ error: "cwd query param is required" }, 400);
+		const resolved = path.resolve(cwd);
+
+		if (resolved === config.defaultCwd)
+			return c.json({ error: "the default workspace cannot be removed" }, 400);
+
+		// Add to denylist.
+		const hidden = getHiddenWorkspaces();
+		if (!hidden.includes(resolved)) setHiddenWorkspaces([...hidden, resolved]);
+
+		// Remove from DB extras.
+		const extras = getExtraWorkspaces();
+		if (extras.includes(resolved)) setExtraWorkspaces(extras.filter((e) => e !== resolved));
+
+		// Best-effort env sync — remove from OMP_DECK_WORKSPACES if present and manageable.
+		if (config.extraWorkspaces.includes(resolved)) {
+			await syncWorkspacesToEnv(
+				config.extraWorkspaces.filter((e) => e !== resolved),
+				config,
+			);
+		}
+
+		return c.json({ ok: true });
+	});
+
 	// ─── Workspace preferences (T-42: per-cwd default model override) ──────
 
 	app.get("/workspace-preferences", (c) => {
@@ -138,16 +224,16 @@ export function buildRouter(
 		const cwd = c.req.query("cwd")?.trim();
 		if (!cwd) return c.json({ error: "cwd query param is required" }, 400);
 		if (!isCwdAllowed(cwd)) {
-			return c.json(
-				{ error: `cwd does not exist, isn't a directory, or is outside the home directory: ${cwd}` },
-				400,
-			);
+			return c.json({ error: cwdNotAllowedMessage() }, 400);
 		}
 		let body: SetWorkspacePreferenceRequest;
 		try {
 			body = (await c.req.json()) as SetWorkspacePreferenceRequest;
 		} catch {
 			return c.json({ error: "invalid json body" }, 400);
+		}
+		if (!body || typeof body !== "object" || Array.isArray(body) || body.model === undefined) {
+			return c.json({ error: "model is required" }, 400);
 		}
 		if (body.model !== null) {
 			const invalid = await validateModelRef(bridge, body.model);
@@ -193,6 +279,33 @@ export function buildRouter(
 	});
 
 	/**
+	 * T-32: best-effort forward link for a session's automatic context
+	 * handoff, if any — see `bridge/session-handoff.ts`. Registered before
+	 * `/sessions/:id/...` so Hono doesn't swallow this static path as an id.
+	 * Bridge-independent (disk-only lookup): works for a live OR a purely
+	 * historical session, since it only needs `cwd` + the session's own file
+	 * path, both already known to any client that has listed or opened it.
+	 */
+	app.get("/sessions/handoff-successor", async (c) => {
+		const cwd = c.req.query("cwd");
+		const sessionFile = c.req.query("sessionFile");
+		if (!cwd || !sessionFile) {
+			return c.json({ error: "cwd and sessionFile query params are required" }, 400);
+		}
+		if (!isCwdAllowed(cwd)) {
+			return c.json({ error: cwdNotAllowedMessage() }, 400);
+		}
+		try {
+			const successor = await findHandoffSuccessor(cwd, sessionFile);
+			const body: GetSessionHandoffSuccessorResponse = { successor: successor ?? null };
+			return c.json(body);
+		} catch (err) {
+			log.error(`findHandoffSuccessor failed`, err);
+			return c.json({ error: String(err) }, 500);
+		}
+	});
+
+	/**
 	 * One page of message history older than `before` (a history index,
 	 * exclusive). Complements the tail-sliced subscribe snapshot: the web
 	 * client calls this as the user scrolls toward the top, walking `before`
@@ -214,6 +327,61 @@ export function buildRouter(
 		return c.json(body);
 	});
 
+	/**
+	 * Read-only tree/timeline of a session's entries (T-31) — works for a
+	 * live session and a persisted-only one alike.
+	 */
+	app.get("/sessions/:id/tree", async (c) => {
+		const id = c.req.param("id");
+		try {
+			const tree = await bridge.getSessionTree(id);
+			if (!tree) return c.json({ error: "session not found" }, 404);
+			const body: SessionTreeResponse = tree;
+			return c.json(body);
+		} catch (err) {
+			log.error(`getSessionTree failed`, err);
+			return c.json({ error: String(err) }, 500);
+		}
+	});
+
+	/**
+	 * Fork a brand-new session rooted at `entryId`'s history (T-31). Never
+	 * mutates the source session — creates a new `.jsonl` file, then resumes
+	 * it into a live handle so the response matches `POST /sessions`.
+	 */
+	app.post("/sessions/:id/branch", async (c) => {
+		const id = c.req.param("id");
+		let body: BranchSessionRequest;
+		try {
+			body = (await c.req.json()) as BranchSessionRequest;
+		} catch {
+			return c.json({ error: "invalid json body" }, 400);
+		}
+		if (!body?.entryId || typeof body.entryId !== "string") {
+			return c.json({ error: "entryId is required" }, 400);
+		}
+		let forked: { sessionFile: string; cwd: string } | undefined;
+		try {
+			forked = await bridge.forkSessionAt(id, body.entryId);
+		} catch (err) {
+			log.error(`forkSessionAt failed`, err);
+			return c.json({ error: String(err) }, 400);
+		}
+		if (!forked) return c.json({ error: "session not found" }, 404);
+		try {
+			const handle = await bridge.resumeSession({ sessionPath: forked.sessionFile });
+			const resp: CreateSessionResponse = {
+				sessionId: handle.sessionId,
+				sessionFile: handle.sessionFile,
+				cwd: handle.cwd,
+			};
+			return c.json(resp);
+		} catch (err) {
+			log.error(`resumeSession after fork failed`, err);
+			return c.json({ error: String(err) }, 500);
+		}
+	});
+
 	app.post("/sessions", async (c) => {
 		let body: CreateSessionRequest;
 		try {
@@ -228,10 +396,7 @@ export function buildRouter(
 		// Only gate cwds the caller actually supplied — resuming a session or
 		// falling back to the (already-trusted) default shouldn't re-validate.
 		if (!body.resumeFromPath && requestedCwd && !isCwdAllowed(requestedCwd)) {
-			return c.json(
-				{ error: `cwd does not exist, isn't a directory, or is outside the home directory: ${requestedCwd}` },
-				400,
-			);
+			return c.json({ error: cwdNotAllowedMessage() }, 400);
 		}
 
 		// Model + Plan Mode are creation-time-only options (T-39): a resumed
@@ -320,11 +485,40 @@ export function buildRouter(
 		const id = c.req.param("id");
 		const handle = bridge.getSession(id);
 		if (!handle) return c.json({ error: "session not found or not active" }, 404);
-		let body: { name?: string; model?: { provider?: unknown; id?: unknown } };
+		let body: { name?: string; model?: { provider?: unknown; id?: unknown }; thinking?: unknown };
 		try {
-			body = (await c.req.json()) as { name?: string; model?: { provider?: unknown; id?: unknown } };
+			body = (await c.req.json()) as { name?: string; model?: { provider?: unknown; id?: unknown }; thinking?: unknown };
 		} catch {
 			return c.json({ error: "invalid json" }, 400);
+		}
+		if (body.model !== undefined && body.thinking !== undefined) {
+			return c.json({ error: "model and thinking must change in separate requests" }, 400);
+		}
+		let thinking: string | undefined;
+		if (body.thinking !== undefined) {
+			if (typeof body.thinking !== "string" || !body.thinking.trim()) {
+				return c.json({ error: "thinking must be a non-empty string" }, 400);
+			}
+			thinking = body.thinking.trim();
+			const snapshot = await handle.snapshot();
+			if (snapshot.planMode?.modelOverride) {
+				return c.json({ error: "thinking cannot change while Plan Mode overrides the model" }, 409);
+			}
+			if (await handle.isStreamingNow()) {
+				return c.json({ error: "thinking cannot change while a turn is streaming" }, 409);
+			}
+			if (!snapshot.model) {
+				return c.json({ error: "session has no active model" }, 409);
+			}
+			const model = (await bridge.listModels({ sessionId: id })).find(
+				(candidate) => candidate.provider === snapshot.model?.provider && candidate.id === snapshot.model?.id,
+			);
+			if (!model?.thinkingLevels?.length) {
+				return c.json({ error: "active model does not support thinking" }, 400);
+			}
+			if (thinking !== "off" && !model.thinkingLevels.includes(thinking)) {
+				return c.json({ error: "thinking level is not supported by the active model" }, 400);
+			}
 		}
 		try {
 			let changed = false;
@@ -341,11 +535,19 @@ export function buildRouter(
 				await handle.setModel({ provider, id: modelId });
 				changed = true;
 			}
+			if (thinking !== undefined) {
+				await handle.setThinkingLevel(thinking);
+				changed = true;
+			}
 			if (changed) broadcastBus.broadcast({ type: "sessions_changed" });
 			return c.json({ ok: true, sessionId: id });
 		} catch (err) {
+			const message = String((err as Error).message ?? err);
+			if (message.startsWith("thinking cannot change while")) {
+				return c.json({ error: message }, 409);
+			}
 			log.error(`patch session failed`, err);
-			return c.json({ error: String((err as Error).message ?? err) }, 500);
+			return c.json({ error: message }, 500);
 		}
 	});
 
@@ -414,8 +616,11 @@ export function buildRouter(
 			projectContext,
 			"",
 			`Current title: ${JSON.stringify(task.title)}`,
+			`Current priority: ${task.priority}`,
+			`Current difficulty: ${task.difficulty}`,
 			`Current body:\n${task.body ?? "(empty)"}`,
 			"",
+			"The rewritten task must preserve the priority and difficulty fields from above — do not change or omit them.",
 			"Return ONLY a JSON object with exactly these fields — no markdown fences, no prose, no explanation:",
 			'{"title": "<improved one-line title>", "body": "<improved body, markdown allowed>"}',
 		].filter(Boolean).join("\n");
@@ -466,6 +671,7 @@ export function buildRouter(
 	app.route("/", buildFsRouter());
 	app.route("/", buildSettingsRouter(bridge, config, opts));
 	app.route("/", buildDelegationRouter());
+	app.route("/", buildPoliciesRouter());
 	app.route("/", buildAdvisorsRouter());
 	app.route("/", buildOrientationRouter());
 	app.route("/", buildBridgesRouter(supervisor));
@@ -473,9 +679,12 @@ export function buildRouter(
 	app.route("/", buildSkillsRouter(skills));
 	app.route("/", buildKbRouter(kb));
 	app.route("/auth/oauth", buildAuthOAuthRouter());
+	app.route("/", buildCodebaseMemoryRouter(isCwdAllowed));
+	app.route("/", buildMemoryRouter(isCwdAllowed));
 	app.route("/onboarding", buildOnboardingRouter());
 	app.route("/", buildUsageRouter(bridge, config));
 	app.route("/", buildAutoWorkRouter(bridge, config));
+	app.route("/", buildGovernanceRouter(bridge));
 
 	return app;
 }

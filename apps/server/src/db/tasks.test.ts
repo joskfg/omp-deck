@@ -7,16 +7,19 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { closeDb, openDb } from "./index.ts";
+import { closeDb, getDb, openDb } from "./index.ts";
 import {
 	createState,
 	createTask,
+	deleteState,
 	deleteTask,
+	getState,
 	getTask,
 	listStates,
 	listTasks,
 	moveTask,
 	reorderStates,
+	updateState,
 	updateTask,
 } from "./tasks.ts";
 
@@ -229,6 +232,35 @@ describe("dependencies (T-57)", () => {
 		expect(updated.dependsOn).toEqual([b.id]);
 	});
 
+	test("rolls back scalar changes when dependency replacement fails", () => {
+		bootDb();
+		const originalDependency = createTask({ title: "original dependency", stateId: "s_backlog" });
+		const replacementDependency = createTask({ title: "replacement dependency", stateId: "s_backlog" });
+		const task = createTask({
+			title: "original title",
+			stateId: "s_backlog",
+			dependsOn: [originalDependency.id],
+		});
+		getDb().exec(`
+			CREATE TRIGGER fail_dependency_insert
+			BEFORE INSERT ON task_dependencies
+			BEGIN
+				SELECT RAISE(ABORT, 'dependency replacement failed');
+			END
+		`);
+
+		expect(() =>
+			updateTask(task.id, {
+				title: "renamed title",
+				dependsOn: [replacementDependency.id],
+			}),
+		).toThrow(/dependency replacement failed/);
+		expect(getTask(task.id)).toMatchObject({
+			title: "original title",
+			dependsOn: [originalDependency.id],
+		});
+	});
+
 	test("updateTask can clear dependencies with an empty array", () => {
 		bootDb();
 		const a = createTask({ title: "a", stateId: "s_backlog" });
@@ -343,5 +375,147 @@ describe("autoWork (T-58)", () => {
 		const updated = updateTask(t.id, { autoWork: true })!;
 		expect(updated.autoWork).toBe(true);
 		expect(updated.dependsOn).toEqual([dep.id]);
+	});
+});
+
+describe("dependency eligibility (T-126)", () => {
+	test("rejects a newly-added dep whose task is in a non-eligible state (done)", () => {
+		bootDb();
+		const blocker = createTask({ title: "done-task", stateId: "s_done" });
+		const t = createTask({ title: "t", stateId: "s_backlog" });
+		expect(() => updateTask(t.id, { dependsOn: [blocker.id] })).toThrow(
+			/not eligible for dependencies/,
+		);
+		expect(getTask(t.id)!.dependsOn).toEqual([]);
+	});
+
+	test("retains an existing dep that has since moved to done when adding another dep", () => {
+		bootDb();
+		const was_active = createTask({ title: "was-active", stateId: "s_backlog" });
+		const new_dep = createTask({ title: "new-dep", stateId: "s_backlog" });
+		const t = createTask({ title: "t", stateId: "s_backlog", dependsOn: [was_active.id] });
+		// Simulate the blocker finishing — move it to done.
+		moveTask(was_active.id, "s_done", 0);
+		// Adding a second dep must NOT reject because the first dep is now in done.
+		const updated = updateTask(t.id, { dependsOn: [was_active.id, new_dep.id] })!;
+		expect(updated.dependsOn).toContain(was_active.id);
+		expect(updated.dependsOn).toContain(new_dep.id);
+	});
+
+	test("rejects a dep that belongs to a different project (different cwd)", () => {
+		bootDb();
+		const other = createTask({ title: "other-project", stateId: "s_backlog", cwd: "/project/b" });
+		const t = createTask({ title: "t", stateId: "s_backlog", cwd: "/project/a" });
+		expect(() => updateTask(t.id, { dependsOn: [other.id] })).toThrow(/different project/);
+		expect(getTask(t.id)!.dependsOn).toEqual([]);
+	});
+
+	test("accepts a dep in the same project", () => {
+		bootDb();
+		const blocker = createTask({ title: "blocker", stateId: "s_backlog", cwd: "/project/a" });
+		const t = createTask({ title: "t", stateId: "s_backlog", cwd: "/project/a" });
+		const updated = updateTask(t.id, { dependsOn: [blocker.id] })!;
+		expect(updated.dependsOn).toEqual([blocker.id]);
+	});
+
+	test("accepts a dep when both tasks have no project (cwd null)", () => {
+		bootDb();
+		const blocker = createTask({ title: "blocker", stateId: "s_backlog" });
+		const t = createTask({ title: "t", stateId: "s_backlog" });
+		const updated = updateTask(t.id, { dependsOn: [blocker.id] })!;
+		expect(updated.dependsOn).toEqual([blocker.id]);
+	});
+
+	test("createTask rejects a dep in a non-eligible state", () => {
+		bootDb();
+		const done = createTask({ title: "done-task", stateId: "s_done" });
+		expect(() => createTask({ title: "t", stateId: "s_backlog", dependsOn: [done.id] })).toThrow(
+			/not eligible for dependencies/,
+		);
+	});
+
+	test("createTask rejects a dep from a different project", () => {
+		bootDb();
+		const other = createTask({ title: "other", stateId: "s_backlog", cwd: "/project/b" });
+		expect(() =>
+			createTask({ title: "t", stateId: "s_backlog", cwd: "/project/a", dependsOn: [other.id] }),
+		).toThrow(/different project/);
+	});
+
+	test("patching cwd is rejected when existing deps are cross-project under the new cwd", () => {
+		bootDb();
+		const dep = createTask({ title: "dep", stateId: "s_backlog", cwd: "/project/a" });
+		const t = createTask({ title: "t", stateId: "s_backlog", cwd: "/project/a", dependsOn: [dep.id] });
+		// Moving t to project/b would make dep cross-project.
+		expect(() => updateTask(t.id, { cwd: "/project/b" })).toThrow(/different project/);
+		// Task and its cwd are unchanged.
+		const unchanged = getTask(t.id)!;
+		expect(unchanged.cwd).toBe("/project/a");
+		expect(unchanged.dependsOn).toEqual([dep.id]);
+	});
+
+	test("patching cwd is allowed when the task has no existing dependencies", () => {
+		bootDb();
+		const t = createTask({ title: "t", stateId: "s_backlog", cwd: "/project/a" });
+		const updated = updateTask(t.id, { cwd: "/project/b" })!;
+		expect(updated.cwd).toBe("/project/b");
+	});
+});
+
+describe("system-state protection (T-126)", () => {
+	test("deleteState rejects deleting s_backlog", () => {
+		bootDb();
+		expect(() => deleteState("s_backlog")).toThrow(/required by the dependency system/);
+		expect(getState("s_backlog")).toBeDefined();
+	});
+
+	test("deleteState rejects deleting s_active", () => {
+		bootDb();
+		expect(() => deleteState("s_active")).toThrow(/required by the dependency system/);
+	});
+
+	test("deleteState rejects deleting s_blocked", () => {
+		bootDb();
+		expect(() => deleteState("s_blocked")).toThrow(/required by the dependency system/);
+	});
+
+	test("deleteState rejects deleting s_validate", () => {
+		bootDb();
+		expect(() => deleteState("s_validate")).toThrow(/required by the dependency system/);
+	});
+
+	test("deleteState allows deleting a non-system state", () => {
+		bootDb();
+		const custom = createState({ name: "custom-column" });
+		const result = deleteState(custom.id);
+		expect(result.reassigned).toBe(0);
+		expect(getState(custom.id)).toBeUndefined();
+	});
+
+	test("updateState rejects renaming s_backlog", () => {
+		bootDb();
+		expect(() => updateState("s_backlog", { name: "queue" })).toThrow(/required by the dependency system/);
+		expect(getState("s_backlog")!.name).toBe("backlog");
+	});
+
+	test("updateState rejects renaming s_active, s_blocked, s_validate", () => {
+		bootDb();
+		expect(() => updateState("s_active", { name: "in-progress" })).toThrow(/required by the dependency system/);
+		expect(() => updateState("s_blocked", { name: "waiting" })).toThrow(/required by the dependency system/);
+		expect(() => updateState("s_validate", { name: "review" })).toThrow(/required by the dependency system/);
+	});
+
+	test("updateState allows changing color of a system state", () => {
+		bootDb();
+		const updated = updateState("s_backlog", { color: "#ff0000" });
+		expect(updated!.color).toBe("#ff0000");
+		expect(updated!.name).toBe("backlog");
+	});
+
+	test("updateState allows renaming a non-system state", () => {
+		bootDb();
+		const custom = createState({ name: "staging" });
+		const updated = updateState(custom.id, { name: "staging-v2" });
+		expect(updated!.name).toBe("staging-v2");
 	});
 });

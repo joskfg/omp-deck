@@ -25,6 +25,8 @@ import { logger } from "./log.ts";
 
 const log = logger("session-title");
 
+const autoTitleInFlight = new Map<string, Promise<void>>();
+
 
 /** Internal task ids look like `t_01kx1s8fxrt7ss33k4` — the convention used by
  *  the "Open in chat" / "Assign to agent" flows embeds one in the prompt
@@ -75,19 +77,27 @@ export async function generateSessionTitle(
  * when `internalTaskModel` is unset (`generateSessionTitle`'s own gate).
  */
 export function maybeAutoTitleSession(bridge: AgentBridge, handle: SessionHandle, firstMessage: string): void {
-	if (!getInternalTaskModel()) return;
-	void (async () => {
-		try {
-			const snapshot = await handle.snapshot();
-			if (snapshot.sessionName) return;
-			const title = await generateSessionTitle(bridge, { sessionId: handle.sessionId, firstMessage });
-			if (!title) return;
-			await handle.setName(title);
-			broadcastBus.broadcast({ type: "sessions_changed" });
-		} catch (err) {
-			log.warn(`auto-title failed for session ${handle.sessionId}`, err);
-		}
-	})();
+	if (!getInternalTaskModel() || autoTitleInFlight.has(handle.sessionId)) return;
+	let task: Promise<void>;
+	task = Promise.resolve()
+		.then(async () => {
+			try {
+				const snapshot = await handle.snapshot();
+				if (snapshot.sessionName) return;
+				const title = await generateSessionTitle(bridge, { sessionId: handle.sessionId, firstMessage });
+				if (!title) return;
+				await handle.setName(title);
+				broadcastBus.broadcast({ type: "sessions_changed" });
+			} catch (err) {
+				log.warn(`auto-title failed for session ${handle.sessionId}`, err);
+			}
+		})
+		.finally(() => {
+			if (autoTitleInFlight.get(handle.sessionId) === task) {
+				autoTitleInFlight.delete(handle.sessionId);
+			}
+		});
+	autoTitleInFlight.set(handle.sessionId, task);
 }
 
 function resolveSessionTitleIntegrationPrompt(): Promise<string> {

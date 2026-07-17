@@ -18,6 +18,17 @@ docs/              # Markdown documentation site
 
 Workspaces are wired through Bun's `workspaces` field in the root `package.json`.
 
+## Required worktree policy
+
+Every change to omp-deck, including code, tests, configuration, and documentation,
+MUST be made from a dedicated task worktree and feature branch. The primary
+checkout is read-only for development work. Never edit, run a development server
+from, or generate build artifacts in that checkout.
+
+Create the worktree from the configured integration branch, make and verify the
+change there, then merge it through the normal review flow. The primary checkout
+may be used only to fetch, inspect, and create or remove worktrees.
+
 ## Dev loop
 
 ```sh

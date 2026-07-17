@@ -1,16 +1,17 @@
 /**
- * Exercises the real Hono router for the internal task model setting. Each
- * assertion covers a persisted API contract rather than the router's internal
- * storage wiring.
+ * Exercises the real Hono router for the internal task model setting and the
+ * KB env schema contract. Each assertion covers a persisted API contract
+ * rather than the router's internal storage wiring.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { InternalTaskModelResponse, ModelInfo } from "@omp-deck/protocol";
+import type { InternalTaskModelResponse, ListEnvSettingsResponse, ModelInfo } from "@omp-deck/protocol";
 
 import { closeDb, openDb } from "./db/index.ts";
+import { ENV_SCHEMA_BY_KEY } from "./env-schema.ts";
 import { buildSettingsRouter } from "./routes-settings.ts";
 import type { Config } from "./config.ts";
 import type { AgentBridge } from "./bridge/types.ts";
@@ -127,5 +128,52 @@ describe("PUT /settings/internal-task-model", () => {
 		const app = buildSettingsRouter(fakeBridge(), fakeConfig());
 		const res = await app.request("/settings/internal-task-model", { method: "PUT", body: "not json" });
 		expect(res.status).toBe(400);
+	});
+});
+
+describe("ENV_SCHEMA KB path contract (T-108)", () => {
+	test("OMP_DECK_KB_ROOT is present in ENV_SCHEMA", () => {
+		expect(ENV_SCHEMA_BY_KEY.has("OMP_DECK_KB_ROOT")).toBe(true);
+	});
+
+	test("OMP_DECK_KB_ROOT entry is a non-sensitive path var", () => {
+		const entry = ENV_SCHEMA_BY_KEY.get("OMP_DECK_KB_ROOT")!;
+		expect(entry.valueType).toBe("path");
+		expect(entry.sensitive).toBe(false);
+	});
+
+	test("OMP_DECK_ORG_ROOT description references OMP_DECK_KB_ROOT not a bare hardcoded path", () => {
+		const entry = ENV_SCHEMA_BY_KEY.get("OMP_DECK_ORG_ROOT")!;
+		expect(entry.description).toMatch(/OMP_DECK_KB_ROOT/);
+	});
+
+	test("GET /settings/env includes an entry for OMP_DECK_KB_ROOT with correct value", async () => {
+		const tmpKb = fs.mkdtempSync(path.join(os.tmpdir(), "omp-deck-t108-kb-"));
+		const savedKbRoot = process.env.OMP_DECK_KB_ROOT;
+		process.env.OMP_DECK_KB_ROOT = tmpKb;
+		try {
+			const app = buildSettingsRouter(fakeBridge(), fakeConfig());
+			const res = await app.request("/settings/env");
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as ListEnvSettingsResponse;
+			const kbEntry = body.entries.find((e) => e.key === "OMP_DECK_KB_ROOT");
+			expect(kbEntry).toBeDefined();
+			expect(kbEntry!.masked).toBe(tmpKb);
+			expect(kbEntry!.source).toBe("process-env");
+		} finally {
+			if (savedKbRoot === undefined) delete process.env.OMP_DECK_KB_ROOT;
+			else process.env.OMP_DECK_KB_ROOT = savedKbRoot;
+			fs.rmSync(tmpKb, { recursive: true, force: true });
+		}
+	});
+
+	test("GET /settings/env OMP_DECK_ORG_ROOT entry description references OMP_DECK_KB_ROOT", async () => {
+		const app = buildSettingsRouter(fakeBridge(), fakeConfig());
+		const res = await app.request("/settings/env");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ListEnvSettingsResponse;
+		const orgEntry = body.entries.find((e) => e.key === "OMP_DECK_ORG_ROOT");
+		expect(orgEntry).toBeDefined();
+		expect(orgEntry!.description).toMatch(/OMP_DECK_KB_ROOT/);
 	});
 });

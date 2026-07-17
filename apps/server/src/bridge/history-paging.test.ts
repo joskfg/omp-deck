@@ -119,4 +119,61 @@ describe("computeUsageRollup", () => {
 		]);
 		expect(withSome.reasoningTokens).toBe(12);
 	});
+	// T-97: Codex sub-agent cost in snapshot rollup
+	test("includes task toolResult details.usage in snapshot rollup (T-97)", () => {
+		const rollup = computeUsageRollup([
+			// Parent assistant turn (e.g. deciding to spawn sub-agents)
+			{
+				role: "assistant",
+				content: [],
+				usage: { input: 100, output: 20, totalTokens: 120, cost: { total: 0.25 } },
+			},
+			// Task tool result carrying aggregated sub-agent usage
+			{
+				role: "toolResult",
+				toolCallId: "tc-1",
+				toolName: "task",
+				content: [{ type: "text", text: "done" }],
+				isError: false,
+				details: {
+					results: [{ id: "Worker1", tokens: 5432 }],
+					usage: {
+						input: 1000,
+						output: 200,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 1200,
+						cost: { input: 0.01, output: 0.032, cacheRead: 0, cacheWrite: 0, total: 0.042 },
+					},
+				},
+			},
+			// Non-task toolResult must not count
+			{
+				role: "toolResult",
+				toolCallId: "tc-2",
+				toolName: "bash",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				details: { usage: { totalTokens: 9999, cost: { total: 99 } } },
+			},
+			// Error task toolResult must not count
+			{
+				role: "toolResult",
+				toolCallId: "tc-3",
+				toolName: "task",
+				content: [{ type: "text", text: "err" }],
+				isError: true,
+				details: { usage: { totalTokens: 9999, cost: { total: 99 } } },
+			},
+		]);
+		const { cost, ...rest } = rollup;
+		expect(rest).toEqual({
+			input: 1100,
+			output: 220,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 1320,
+		});
+		expect(cost).toBeCloseTo(0.292, 6);
+	});
 });

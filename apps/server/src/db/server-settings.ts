@@ -5,7 +5,8 @@
  *
  * Add typed wrappers around `getServerSetting` / `setServerSetting` as new
  * global settings show up rather than growing ad-hoc tables per setting.
- * Current consumers: `deckBaseUrl` (T-61), `taskRewriteModel` (T-76), `internalTaskModel` (T-78).
+ * Current consumers: `deckBaseUrl` (T-61), `taskRewriteModel` (T-76), `internalTaskModel` (T-78),
+ * `planModel` (T-30), `extraWorkspaces`, `hiddenWorkspaces` (T-134).
  */
 
 import type { Config } from "../config.ts";
@@ -155,4 +156,60 @@ export function setPlanModel(model: PlanModelConfigRaw | null): PlanModelConfigR
 		setServerSetting(PLAN_MODEL_KEY, JSON.stringify(record));
 	}
 	return getPlanModel();
+}
+
+// ─── Workspace registry (T-134) ─────────────────────────────────────────────
+
+const EXTRA_WORKSPACES_KEY = "extraWorkspaces";
+
+/**
+ * Workspaces explicitly registered via the Projects UI (T-134). Supplements
+ * `config.extraWorkspaces` (from OMP_DECK_WORKSPACES) and session-discovered
+ * cwds in `GET /workspaces`. Stored as a JSON array of absolute paths.
+ */
+export function getExtraWorkspaces(): string[] {
+	const raw = getServerSetting(EXTRA_WORKSPACES_KEY);
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed.filter((v): v is string => typeof v === "string");
+	} catch {
+		return [];
+	}
+}
+
+export function setExtraWorkspaces(cwds: string[]): void {
+	if (cwds.length === 0) {
+		deleteServerSetting(EXTRA_WORKSPACES_KEY);
+	} else {
+		setServerSetting(EXTRA_WORKSPACES_KEY, JSON.stringify(cwds));
+	}
+}
+
+const HIDDEN_WORKSPACES_KEY = "hiddenWorkspaces";
+
+/**
+ * Denylist: cwds excluded from `GET /workspaces` regardless of env config or
+ * session history (T-134). Stored as a JSON array of absolute paths.
+ * `defaultCwd` is never added here — it cannot be hidden.
+ */
+export function getHiddenWorkspaces(): string[] {
+	const raw = getServerSetting(HIDDEN_WORKSPACES_KEY);
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed.filter((v): v is string => typeof v === "string");
+	} catch {
+		return [];
+	}
+}
+
+export function setHiddenWorkspaces(cwds: string[]): void {
+	if (cwds.length === 0) {
+		deleteServerSetting(HIDDEN_WORKSPACES_KEY);
+	} else {
+		setServerSetting(HIDDEN_WORKSPACES_KEY, JSON.stringify(cwds));
+	}
 }

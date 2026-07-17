@@ -21,11 +21,12 @@
  * On a successful run, `settleAutoWorkRun` opens a PR from the worktree
  * branch, appends a session-link + PR-reference note to the task body, and
  * moves the task to `validate` (never `done` — every auto-work result is
- * human-reviewed) before closing the run row `status: "completed"`. When
- * `gh pr create` itself fails, the implementation is still complete and the
- * task still moves to validate, but the run closes as
- * `status: "completed_pr_failed"` with an actionable `failureReason`
- * instead — distinct from a real success (T-85).
+ * human-reviewed) before closing the run row `status: "completed"`. If the
+ * validate state is unavailable, it safely parks the task in `blocked` with
+ * an actionable reason. When `gh pr create` itself fails, the implementation
+ * is still complete and the run closes as `status: "completed_pr_failed"`
+ * with an actionable `failureReason` instead — distinct from a real success
+ * (T-85).
  *
  * Explicitly out of scope here (later tickets in the stack):
  *  - T-67: notifications. Lifecycle transitions are logged at info/warn so a
@@ -39,9 +40,11 @@ import type { Subprocess } from "bun";
 import type {
 	AutoWorkConfig,
 	AutoWorkCycleResult,
+	AutoWorkGlobalConfig,
 	AutoWorkRun,
 	ModelRef,
 	Task,
+	TaskDifficulty,
 	TaskPriority,
 } from "@omp-deck/protocol";
 
@@ -49,9 +52,11 @@ import type { AgentBridge, SessionHandle } from "../bridge/types.ts";
 import { loadConfig } from "../config.ts";
 import { buildSessionUrl } from "../deck-links.ts";
 import { getAutoWorkConfig } from "../db/auto-work.ts";
+import { getAutoWorkGlobalConfig } from "../db/auto-work-global.ts";
 import { resolveIntegrationPrompt, type IntegrationPromptName } from "../integration-prompts.ts";
+import { KB_TEMPLATES } from "../kb-templates.ts";
 import { KbService, resolveKbRoot, resolveProjectBranchPolicy } from "../kb-service.ts";
-import { completeAutoWorkRun, listAutoWorkRuns, startAutoWorkRun } from "../db/auto-work-runs.ts";
+import { completeAutoWorkRun, countConsecutiveAutoWorkFailures, listAutoWorkRuns, startAutoWorkRun } from "../db/auto-work-runs.ts";
 import { getDeckBaseUrl as getServerDeckBaseUrl } from "../db/server-settings.ts";
 import { findStateByName, getTask, listTasks, moveTask, updateTask } from "../db/tasks.ts";
 import { getWorkspacePreference } from "../db/workspace-preferences.ts";
@@ -63,14 +68,42 @@ import { getSubscriptionUsage } from "../usage-subscription.ts";
 import { estimateTaskCostPct } from "./estimate.ts";
 import { broadcastBus } from "../broadcast-bus.ts";
 import { getModelCatalogOverlay } from "../model-catalog-overlay.ts";
+import { assertNoSecretsInDiff, assertNoSensitiveContent } from "./pr-content-guard.ts";
 
 const log = logger("auto-work:engine");
 
 const PRIORITY_ORDER: Record<TaskPriority, number> = { P0: 0, P1: 1, P2: 2, P3: 3, P4: 4, P5: 5 };
 
+/** Ordered from highest to lowest effort — cascade walks downward only. */
+const DIFFICULTY_CASCADE: TaskDifficulty[] = ["hard", "medium", "easy"];
+
+
 /** Run ids with a live engine finalizer. They are never stale, even between terminal event delivery and DB completion. */
 const activeRunIds = new Set<string>();
 const STALE_RUN_GRACE_MS = 60_000;
+
+/**
+ * True when this process has a live `finalizeAutoWorkRun` awaiting `runId`'s
+ * terminal event — the authoritative "is a running row genuinely in flight
+ * here" signal (T-106). A truthy `bridge.getSession(run.sessionId)` is NOT
+ * sufficient: after a restart it can resurrect a persisted handle from disk
+ * even though nothing in this process is watching it finish.
+ */
+export function hasActiveAutoWorkRunFinalizer(runId: string): boolean {
+	return activeRunIds.has(runId);
+}
+
+/** Run ids explicitly stopped by the user or operator, preventing within-run abort retries for those runs. */
+const intentionallyStoppedRunIds = new Set<string>();
+
+/**
+ * Called by the stop route before `handle.abort()` so the live finalizer
+ * knows the abort was intentional and skips the within-run retry path for
+ * `aborted` terminal events.
+ */
+export function markRunIntentionallyStopped(runId: string): void {
+	intentionallyStoppedRunIds.add(runId);
+}
 
 // ─── Pure decision logic ────────────────────────────────────────────────────
 
@@ -158,12 +191,20 @@ export interface TaskSelectionInput {
 	doneStateId: string;
 	/** Injected rather than calling `estimateTaskCostPct` directly, so this stays DB-free and pure. */
 	estimateCostPct: (priority: TaskPriority) => number;
+	/**
+	 * Pin selection to this exact task id. Set by `runGlobalAutoWorkCycle`
+	 * so the winner it announced is exactly the task the inner cycle runs.
+	 * A pinned task that is no longer eligible or affordable yields
+	 * `pinned_unavailable` — never a silently different task.
+	 */
+	pinnedTaskId?: string;
 }
 
 export type TaskSelectionResult =
 	| { kind: "selected"; task: Task; estimatedCostPct: number }
 	| { kind: "none_eligible" }
-	| { kind: "none_fit"; consideredCount: number };
+	| { kind: "none_fit"; consideredCount: number }
+	| { kind: "pinned_unavailable" };
 
 /**
  * `autoWork=true` AND `stateId=backlog` AND every `dependsOn` task is
@@ -173,13 +214,23 @@ export type TaskSelectionResult =
  * priority task further down the list may still be affordable.
  */
 export function selectNextAutoWorkTask(input: TaskSelectionInput): TaskSelectionResult {
-	const { tasks, config, currentPctUsed, backlogStateId, doneStateId, estimateCostPct } = input;
+	const { tasks, config, currentPctUsed, backlogStateId, doneStateId, estimateCostPct, pinnedTaskId } = input;
 	const tasksById = new Map(tasks.map((t) => [t.id, t]));
 
 	const eligible = tasks
 		.filter((t) => t.autoWork && t.stateId === backlogStateId)
 		.filter((t) => t.dependsOn.every((depId) => tasksById.get(depId)?.stateId === doneStateId))
 		.sort((a, b) => PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority] || a.orderInState - b.orderInState);
+
+	if (pinnedTaskId !== undefined) {
+		const pinned = eligible.find((t) => t.id === pinnedTaskId);
+		if (!pinned) return { kind: "pinned_unavailable" };
+		const estimatedCostPct = estimateCostPct(pinned.priority);
+		if (!costFitsAutoWorkBudget(estimatedCostPct, currentPctUsed, config)) {
+			return { kind: "pinned_unavailable" };
+		}
+		return { kind: "selected", task: pinned, estimatedCostPct };
+	}
 
 	if (eligible.length === 0) return { kind: "none_eligible" };
 
@@ -199,17 +250,28 @@ export function resolveAutoWorkTimeoutMinutes(priority: TaskPriority, config: Au
 }
 
 /**
- * Model resolution order: per-priority override (T-60 config) → per-workspace
- * default (T-42's `WorkspacePreference`) → `undefined`, which leaves the
- * `model` field off `CreateSessionOpts` entirely so the bridge/SDK picks its
- * own global default (same fallback chain `POST /sessions` uses).
+ * Model resolution (T-109): tries the task's difficulty in each config tier
+ * (workspace, then global), cascading to lower difficulties only
+ * (hard→medium→easy) before falling back to the workspace default model.
  */
 export function resolveAutoWorkModel(
-	priority: TaskPriority,
+	difficulty: TaskDifficulty,
 	config: AutoWorkConfig,
+	globalConfig: AutoWorkGlobalConfig,
 	workspaceDefaultModel: ModelRef | null,
 ): ModelRef | undefined {
-	return config.modelByPriority[priority] ?? workspaceDefaultModel ?? undefined;
+	const startIdx = DIFFICULTY_CASCADE.indexOf(difficulty);
+	// Walk workspace mapping from task difficulty downward.
+	for (let i = startIdx; i < DIFFICULTY_CASCADE.length; i++) {
+		const m = config.modelByDifficulty[DIFFICULTY_CASCADE[i]!];
+		if (m !== null) return m;
+	}
+	// Walk global mapping from task difficulty downward.
+	for (let i = startIdx; i < DIFFICULTY_CASCADE.length; i++) {
+		const m = globalConfig.modelByDifficulty[DIFFICULTY_CASCADE[i]!];
+		if (m !== null) return m;
+	}
+	return workspaceDefaultModel ?? undefined;
 }
 
 export type RunningAutoWorkRunClassification = "resume" | "reconnect" | "stale";
@@ -368,6 +430,12 @@ export interface RunAutoWorkCycleOptions {
 	 * to skip that call and keep worktree/branch names predictable.
 	 */
 	generateBranchSlug?: (task: Task) => Promise<string>;
+	/**
+	 * Pin the inner cycle's selection to one task id — see
+	 * `TaskSelectionInput.pinnedTaskId`. Production sets this from the
+	 * global cycle's winner; a plain per-workspace cycle leaves it unset.
+	 */
+	pinnedTaskId?: string;
 }
 
 /** Candidate supplied to the optional cross-workspace task selector. */
@@ -389,13 +457,21 @@ export interface RunGlobalAutoWorkCycleOptions extends RunAutoWorkCycleOptions {
 let integrationKb: KbService | undefined;
 let integrationKbRoot: string | undefined;
 
-function resolveAutoWorkIntegrationPrompt(name: IntegrationPromptName): Promise<string> {
+async function resolveAutoWorkIntegrationPrompt(name: IntegrationPromptName): Promise<string> {
 	const root = resolveKbRoot();
 	if (!integrationKb || integrationKbRoot !== root) {
 		integrationKb = new KbService({ root });
 		integrationKbRoot = root;
 	}
-	return resolveIntegrationPrompt(integrationKb, name);
+	// T-105: a broken KB (unreadable root, index failure) must never abort an
+	// auto-work cycle — fall back to the bundled template so the session still
+	// gets its core instructions, and log loudly so the KB problem is visible.
+	try {
+		return await resolveIntegrationPrompt(integrationKb, name);
+	} catch (err) {
+		log.error(`integration prompt "${name}" failed to resolve from the KB, using the bundled template`, err);
+		return KB_TEMPLATES.find((t) => t.dir === "integrations" && t.name === `${name}.md`)?.body ?? "";
+	}
 }
 
 
@@ -433,7 +509,7 @@ export async function runAutoWorkCycle(
 	}
 
 	const allTasks = listTasks();
-	const workspaceTasks = allTasks.filter((t) => t.cwd === cwd);
+	let workspaceTasks = allTasks.filter((t) => t.cwd === cwd);
 	const workspaceTaskIds = new Set(workspaceTasks.map((t) => t.id));
 	let activeRuns = listAutoWorkRuns({ status: "running" }).filter((r) => workspaceTaskIds.has(r.taskId));
 
@@ -451,6 +527,11 @@ export async function runAutoWorkCycle(
 		});
 		if (resumed) return resumed;
 		activeRuns = activeRuns.filter((r) => r.id !== runningRun.id);
+		// The retire path just closed the run and re-routed its task
+		// (backlog/blocked) — refresh the snapshot taken above so this same
+		// cycle can already see and select the re-routed task instead of
+		// idling until the next tick.
+		workspaceTasks = listTasks().filter((t) => t.cwd === cwd);
 	}
 
 	const preflight = checkAutoWorkPreflight({ config, now, subscriptionPctUsed, sessionPctUsed, activeRuns });
@@ -476,13 +557,16 @@ export async function runAutoWorkCycle(
 		backlogStateId: backlogState.id,
 		doneStateId: doneState.id,
 		estimateCostPct: (priority) => estimateTaskCostPct(priority, config),
+		pinnedTaskId: options.pinnedTaskId,
 	});
 
 	if (selection.kind !== "selected") {
 		const reason =
 			selection.kind === "none_eligible"
 				? "no eligible auto-work tasks in backlog (autoWork flag, dependencies, or state)"
-				: `${selection.consideredCount} eligible task(s) considered but none fit the current cost/budget limits`;
+				: selection.kind === "pinned_unavailable"
+					? "the globally selected task is no longer eligible or affordable — reselecting on the next cycle"
+					: `${selection.consideredCount} eligible task(s) considered but none fit the current cost/budget limits`;
 		log.info(`cycle for ${cwd}: ${reason}`);
 		// Session-limit notification (T-67) — only for the "considered but none
 		// fit" case (a genuine budget-driven pause), and only when the weekly
@@ -505,28 +589,73 @@ export async function runAutoWorkCycle(
 	);
 
 	const workspacePreference = getWorkspacePreference(cwd);
-	const model = resolveAutoWorkModel(task.priority, config, workspacePreference?.model ?? null);
+	const globalConfig = getAutoWorkGlobalConfig();
+	const model = resolveAutoWorkModel(task.difficulty, config, globalConfig, workspacePreference?.model ?? null);
 	if (model) {
 		const invalid = await validateModelRef(bridge, model);
 		if (invalid) {
-			const reason = `configured model for ${task.priority} is invalid: ${invalid}`;
+			const reason = `configured model for difficulty=${task.difficulty} is invalid: ${invalid}`;
 			log.error(reason);
 			return { outcome: "skipped", reason };
 		}
 	}
 
-	// Default here is the plain synchronous slug (no model call): this keeps
-	// `runAutoWorkCycle`'s own unit tests fast and deterministic without a
-	// second `bridge.createSession` call. `runGlobalAutoWorkCycle` — the real
-	// production entry point — injects the LLM-backed generator by default.
-	const branchSlug = options.generateBranchSlug ? await options.generateBranchSlug(task) : slugifyTaskTitle(task.title);
-	const worktreePath = await createAutoWorkWorktree(cwd, task, branchSlug);
+	// T-104: a retry of a task whose previous attempt failed resumes that
+	// attempt's session — full prior context, same worktree — instead of
+	// starting from scratch. Falls back to a fresh session when the prior
+	// session or worktree no longer exists.
+	const retry = await resumePriorFailedRunSession(bridge, task);
 
-	const session = await bridge.createSession({
-		cwd,
-		systemPromptAppend: await resolveAutoWorkIntegrationPrompt("auto-work"),
-		...(model ? { model } : {}),
-	});
+	const agentHistory = extractAgentHistory(task.body);
+	const historyBlock = agentHistory ? `\n\n## Agent history for this task\n${agentHistory}` : "";
+
+	let session: SessionHandle;
+	let worktreePath: string;
+	let prompt: string;
+	if (retry) {
+		session = retry.session;
+		worktreePath = retry.priorRun.worktreePath;
+		const failureNote = retry.priorRun.failureReason ? ` Motivo: ${retry.priorRun.failureReason}.` : "";
+		prompt =
+			`Reintento de Auto Work para T-${task.displayId}: ${task.title}\n\n` +
+			`Tu intento anterior (run \`${retry.priorRun.id}\`) terminó en estado ${retry.priorRun.status}.${failureNote} ` +
+			`Continúa el trabajo donde lo dejaste en el worktree \`${worktreePath}\` (misma rama). ` +
+			`Revisa primero el estado real (commits, tests) y completa lo que falte.\n\n` +
+			`(contexto completo disponible via GET /api/tasks/${task.id})${historyBlock}`;
+		log.info(`T-${task.displayId}: resuming prior session ${session.sessionId} for retry of run ${retry.priorRun.id}`);
+	} else {
+		// Default here is the plain synchronous slug (no model call): this keeps
+		// `runAutoWorkCycle`'s own unit tests fast and deterministic without a
+		// second `bridge.createSession` call. `runGlobalAutoWorkCycle` — the real
+		// production entry point — injects the LLM-backed generator by default.
+		const branchSlug = options.generateBranchSlug ? await options.generateBranchSlug(task) : slugifyTaskTitle(task.title);
+		worktreePath = await createAutoWorkWorktree(cwd, task, branchSlug);
+
+		try {
+			session = await bridge.createSession({
+				cwd,
+				systemPromptAppend: await resolveAutoWorkIntegrationPrompt("auto-work"),
+				...(model ? { model } : {}),
+			});
+		} catch (err) {
+			// T-105: a session that cannot even launch must not abort the cycle
+			// with an exception — the scheduler would re-select this same task
+			// every tick, starving everything behind it. Park the task in
+			// blocked with a visible note, moving it back to backlog explicitly
+			// grants another attempt.
+			const msg = ((err instanceof Error ? err.message : String(err)).split("\n")[0] ?? "").trim().slice(0, 160);
+			const reason = `agent session launch failed: ${msg}`;
+			log.error(`T-${task.displayId}: ${reason}`, err);
+			updateTask(task.id, {
+				body: `${task.body}\n\n---\n**Auto Work launch failed** — ${reason}. Task parked in blocked, move it back to backlog to retry. Worktree: \`${worktreePath}\`.`,
+			});
+			moveTask(task.id, blockedState.id, 0);
+			broadcastBus.broadcast({ type: "tasks_changed" });
+			await notify({ kind: "task_failed", displayId: task.displayId, reason });
+			return { outcome: "skipped", reason };
+		}
+		prompt = `Trabaja en T-${task.displayId}: ${task.title}\n\n(contexto completo disponible via GET /api/tasks/${task.id})\n\nEl worktree para esta tarea ya está configurado en \`${worktreePath}\` (rama \`auto-work/t${task.displayId}-${branchSlug}\`). Usa ese directorio para todos los commits y cambios de fichero.${historyBlock}`;
+	}
 
 	moveTask(task.id, activeState.id, 0);
 	const runId = startAutoWorkRun({
@@ -535,7 +664,9 @@ export async function runAutoWorkCycle(
 		sessionId: session.sessionId,
 		worktreePath,
 	});
-	log.info(`run ${runId} started for T-${task.displayId}, session ${session.sessionId}, worktree ${worktreePath}`);
+	log.info(
+		`run ${runId} started for T-${task.displayId}, session ${session.sessionId}, worktree ${worktreePath}${retry ? " (resumed prior session)" : ""}`,
+	);
 	broadcastBus.broadcast({ type: "auto_work_runs_changed" });
 	await notify({
 		kind: "task_started",
@@ -544,13 +675,11 @@ export async function runAutoWorkCycle(
 		model: model ? `${model.provider}/${model.id}` : "default",
 	});
 
-	const agentHistory = extractAgentHistory(task.body);
-	const historyBlock = agentHistory ? `\n\n## Agent history for this task\n${agentHistory}` : "";
-	const prompt = `Trabaja en T-${task.displayId}: ${task.title}\n\n(contexto completo disponible via GET /api/tasks/${task.id})\n\nEl worktree para esta tarea ya está configurado en \`${worktreePath}\` (rama \`auto-work/t${task.displayId}-${branchSlug}\`). Usa ese directorio para todos los commits y cambios de fichero.${historyBlock}`;
 	// T-94: title the session from its first-turn prompt, matching the
 	// regular-chat auto-title behavior (T-78). Fire-and-forget — never
-	// delays the actual agent turn below.
-	maybeAutoTitleSession(bridge, session, prompt);
+	// delays the actual agent turn below. Only a fresh session needs a
+	// title; a resumed one keeps the title it already has.
+	if (!retry) maybeAutoTitleSession(bridge, session, prompt);
 	const timeoutMinutes = resolveAutoWorkTimeoutMinutes(task.priority, config);
 	return await finalizeAutoWorkRun({
 		runId,
@@ -569,7 +698,96 @@ export async function runAutoWorkCycle(
 	});
 }
 
+/**
+ * T-104: when the engine re-selects a task whose most recent run ended
+ * failed/timed_out, resume that run's persisted session (the transcript
+ * survives `dispose()`) so the retry keeps the full prior context and
+ * reuses the same worktree/branch. Returns undefined — the retry starts a
+ * fresh session — when the prior worktree or persisted session is gone,
+ * or when resuming fails for any reason. Never throws.
+ */
+async function resumePriorFailedRunSession(
+	bridge: AgentBridge,
+	task: Task,
+): Promise<{ session: SessionHandle; priorRun: AutoWorkRun } | undefined> {
+	const [prior] = listAutoWorkRuns({ taskId: task.id, limit: 1 });
+	if (!prior || (prior.status !== "failed" && prior.status !== "timed_out")) return undefined;
+	if (!fs.existsSync(prior.worktreePath)) return undefined;
+	try {
+		const live = bridge.getSession(prior.sessionId);
+		if (live) return { session: live, priorRun: prior };
+		const persisted = await findPersistedAutoWorkSession(bridge, prior);
+		if (!persisted) return undefined;
+		const session = await bridge.resumeSession({
+			sessionPath: persisted.path,
+			systemPromptAppend: await resolveAutoWorkIntegrationPrompt("auto-work"),
+		});
+		return { session, priorRun: prior };
+	} catch (err) {
+		log.warn(
+			`T-${task.displayId}: could not resume prior session ${prior.sessionId} for the retry, starting a fresh session`,
+			err,
+		);
+		return undefined;
+	}
+}
+
 // ─── Small IO helpers ───────────────────────────────────────────────────────
+
+/**
+ * Max consecutive failed/timed-out runs (first attempt included) before Auto
+ * Work stops re-queuing a task (T-100). A successful run resets the streak.
+ * Once exhausted the task parks in `blocked` with a MAX_RETRIES_EXCEEDED
+ * marker; a human moving it back to `backlog` explicitly grants one more
+ * attempt — the engine itself never returns an exhausted task to `backlog`.
+ */
+export const MAX_AUTO_WORK_TASK_ATTEMPTS = 3;
+
+/**
+ * How many times a live run may resend a continuation prompt to the same
+ * session after an unexpected `aborted` terminal event before the run is
+ * written off as failed. Intentional stops (`markRunIntentionallyStopped`)
+ * bypass this limit and never retry.
+ */
+export const MAX_SAME_RUN_ABORT_RETRIES = 1;
+
+interface FailedRunRouting {
+	/** Consecutive failures including the run just closed. */
+	attempts: number;
+	exhausted: boolean;
+	targetStateName: "backlog" | "blocked";
+}
+
+/**
+ * Post-failure task routing (T-100). Call AFTER `completeAutoWorkRun` marked
+ * the run failed so the streak includes it: back to `backlog` (auto-retry on
+ * a later tick) while under `MAX_AUTO_WORK_TASK_ATTEMPTS`, otherwise parked
+ * in `blocked` so the next cycle deterministically moves on to another task
+ * instead of re-running this one forever.
+ */
+function routeTaskAfterFailedRun(taskId: string): FailedRunRouting {
+	const attempts = countConsecutiveAutoWorkFailures(taskId);
+	const exhausted = attempts >= MAX_AUTO_WORK_TASK_ATTEMPTS;
+	const targetStateName = exhausted ? "blocked" : "backlog";
+	const targetState = findStateByName(targetStateName);
+	if (targetState) moveTask(taskId, targetState.id, 0);
+	return { attempts, exhausted, targetStateName };
+}
+
+/** Human-readable retry decision for task notes, history entries, and logs. */
+function describeRetryDecision(routing: FailedRunRouting): string {
+	return routing.exhausted
+		? `MAX_RETRIES_EXCEEDED (${routing.attempts} consecutive failed runs, limit ${MAX_AUTO_WORK_TASK_ATTEMPTS}) — Auto Work parked the task in blocked; move it back to backlog to grant one more attempt`
+		: `${MAX_AUTO_WORK_TASK_ATTEMPTS - routing.attempts} automatic retry attempt(s) remaining`;
+}
+
+export function failAutoWorkRun(runId: string, taskId: string, failureReason: string): FailedRunRouting {
+	completeAutoWorkRun(runId, { status: "failed", failureReason });
+	const routing = routeTaskAfterFailedRun(taskId);
+	broadcastBus.broadcast({ type: "tasks_changed" });
+	broadcastBus.broadcast({ type: "auto_work_runs_changed" });
+	return routing;
+}
 
 /**
  * Shared tail of the "a session is actively running" path — waits for
@@ -580,20 +798,14 @@ export async function runAutoWorkCycle(
  *
  * The success branch (T-66) opens a PR from the worktree branch, appends a
  * session-link + PR-reference note to the task body, and moves the task to
- * `validate` (never `done` — every auto-work result is human-reviewed). A PR
- * creation failure does not fail the run: the agent's work did complete, so
- * the task still moves to `validate` with a note that the PR needs to be
- * opened by hand — surfacing that loudly in the body and the logs beats
- * silently discarding a completed session behind an unrelated `gh` error.
+ * `validate` (never `done` — every auto-work result is human-reviewed). If
+ * validate is unavailable, it moves the task to `blocked` with a visible
+ * reason rather than leaving it active. A PR creation failure does not fail
+ * the run: the agent's work did complete, so the task still moves to validate
+ * with a note that the PR needs to be opened by hand — surfacing that loudly
+ * in the body and the logs beats silently discarding a completed session
+ * behind an unrelated `gh` error.
  */
-function failAutoWorkRun(runId: string, taskId: string, failureReason: string): void {
-	completeAutoWorkRun(runId, { status: "failed", failureReason });
-	const backlogState = findStateByName("backlog");
-	if (backlogState) moveTask(taskId, backlogState.id, 0);
-	broadcastBus.broadcast({ type: "tasks_changed" });
-	broadcastBus.broadcast({ type: "auto_work_runs_changed" });
-}
-
 function finalizeAutoWorkRun(params: {
 	runId: string;
 	task: Task;
@@ -616,7 +828,10 @@ function finalizeAutoWorkRun(params: {
 	startPct: number | null;
 }): Promise<AutoWorkCycleResult> {
 	activeRunIds.add(params.runId);
-	return settleAutoWorkRun(params).finally(() => activeRunIds.delete(params.runId));
+	return settleAutoWorkRun(params).finally(() => {
+		activeRunIds.delete(params.runId);
+		intentionallyStoppedRunIds.delete(params.runId);
+	});
 }
 
 async function settleAutoWorkRun(params: {
@@ -636,7 +851,33 @@ async function settleAutoWorkRun(params: {
 }): Promise<AutoWorkCycleResult> {
 	const { runId, task, session, worktreePath, timeoutMinutes, startTurn, resolveDeckBaseUrl, createPullRequest, autoMerge, armAutoMerge, notify, usageLookup, startPct } =
 		params;
-	const terminal = await waitForAutoWorkSessionTerminalResult(session, timeoutMinutes * 60_000, startTurn);
+	// Same-run abort retry: an unexpected `aborted` terminal event is retried
+	// once within the same run by sending a continuation prompt to the same
+	// session. Intentional stops (via `markRunIntentionallyStopped`) bypass this
+	// so the user's explicit stop is always respected. Non-abort failures
+	// (`max_tokens`, `length`, `refusal`, `error`) are never retried in-run.
+	let currentStartTurn: (() => Promise<unknown>) | undefined = startTurn;
+	let terminal!: AutoWorkTerminalResult;
+	let sameRunAborts = 0;
+	do {
+		terminal = await waitForAutoWorkSessionTerminalResult(session, timeoutMinutes * 60_000, currentStartTurn);
+		currentStartTurn = undefined;
+		if (
+			terminal.outcome === "failed" &&
+			terminal.failureReason === "agent turn ended with stop reason: aborted" &&
+			!intentionallyStoppedRunIds.has(runId) &&
+			sameRunAborts < MAX_SAME_RUN_ABORT_RETRIES
+		) {
+			sameRunAborts++;
+			log.warn(
+				`run ${runId}: turn aborted unexpectedly — sending continuation prompt (same-run retry ${sameRunAborts}/${MAX_SAME_RUN_ABORT_RETRIES})`,
+			);
+			currentStartTurn = () =>
+				session.prompt(
+					`El turno anterior fue interrumpido inesperadamente. Revisa el estado del worktree y continúa el trabajo desde donde lo dejaste.`,
+				);
+		}
+	} while (currentStartTurn !== undefined);
 
 	// Capture real token usage for this run (T-80). Both calls run concurrently;
 	// failures are logged and default to null — missing usage is never fatal.
@@ -657,7 +898,7 @@ async function settleAutoWorkRun(params: {
 		typeof endUsageResult.value.weeklyPct === "number"
 			? endUsageResult.value.weeklyPct
 			: null;
-	const pctConsumed: number | null = startPct !== null && endPct !== null ? endPct - startPct : null;
+	const pctConsumed: number | null = startPct !== null && endPct !== null ? Math.max(0, endPct - startPct) : null;
 
 	if (terminal.outcome !== "completed") {
 		const timedOut = terminal.outcome === "timed_out";
@@ -670,25 +911,53 @@ async function settleAutoWorkRun(params: {
 			// otherwise the agent keeps working (and spending) after the run
 			// was already written off, and may even finish the task.
 			await session.abort().catch((err) => log.warn(`run ${runId}: abort after timeout failed`, err));
-			completeAutoWorkRun(runId, { status: "timed_out", failureReason, inputTokens, outputTokens, pctConsumed });
-			broadcastBus.broadcast({ type: "auto_work_runs_changed" });
-		} else {
-			// Inline failAutoWorkRun so we can pass captured token usage (T-80).
-			completeAutoWorkRun(runId, { status: "failed", failureReason, inputTokens, outputTokens, pctConsumed });
-			const backlogState = findStateByName("backlog");
-			if (backlogState) moveTask(task.id, backlogState.id, 0);
-			broadcastBus.broadcast({ type: "tasks_changed" });
-			broadcastBus.broadcast({ type: "auto_work_runs_changed" });
 		}
-		const terminalState = findStateByName(timedOut ? "blocked" : "backlog");
-		if (terminalState) moveTask(task.id, terminalState.id, 0);
-		const failRunNote = `\n\n---\n**Auto Work ${timedOut ? "timeout" : "aborted"}** — run \`${runId}\` ${failureReason}. Session: \`${session.sessionId}\`, worktree: \`${worktreePath}\`.`;
-		const failHistorySummary = `${timedOut ? "Timed out" : "Failed"}: ${failureReason}.`;
+		completeAutoWorkRun(runId, {
+			status: timedOut ? "timed_out" : "failed",
+			failureReason,
+			inputTokens,
+			outputTokens,
+			pctConsumed,
+		});
+		broadcastBus.broadcast({ type: "auto_work_runs_changed" });
+		// T-100: a failed turn can leave the session alive (queued prompts, a
+		// turn that errored mid-stream). Abort defensively, then release the
+		// live handle so a written-off run cannot keep spending. The session
+		// transcript persists on disk — still inspectable and resumable.
+		if (!timedOut) {
+			try {
+				if (await session.isStreamingNow()) await session.abort();
+			} catch (err) {
+				log.warn(`run ${runId}: abort of failed session failed`, err);
+			}
+		}
+		try {
+			await session.dispose();
+		} catch (err) {
+			log.warn(`run ${runId}: dispose of terminal session failed`, err);
+		}
+		// T-100: deterministic next-tick decision. A timed-out task parks in
+		// `blocked` (unchanged); a failed one returns to `backlog` while its
+		// consecutive-failure budget lasts, else parks in `blocked` with a
+		// MAX_RETRIES_EXCEEDED marker so the next cycle picks another task.
+		let movedTo: "backlog" | "blocked";
+		let decision = "";
+		if (timedOut) {
+			const blockedState = findStateByName("blocked");
+			if (blockedState) moveTask(task.id, blockedState.id, 0);
+			movedTo = "blocked";
+		} else {
+			const routing = routeTaskAfterFailedRun(task.id);
+			movedTo = routing.targetStateName;
+			decision = ` ${describeRetryDecision(routing)}.`;
+		}
+		const failRunNote = `\n\n---\n**Auto Work ${timedOut ? "timeout" : "aborted"}** — run \`${runId}\` ${failureReason}.${decision} Session: \`${session.sessionId}\`, worktree: \`${worktreePath}\`.`;
+		const failHistorySummary = `${timedOut ? "Timed out" : "Failed"}: ${failureReason}.${decision}`;
 		updateTask(task.id, {
 			body: appendAgentHistoryEntry(task.body + failRunNote, runId, new Date().toISOString(), failHistorySummary),
 		});
 		broadcastBus.broadcast({ type: "tasks_changed" });
-		log.warn(`run ${runId} ${timedOut ? "timed out" : "failed"}; T-${task.displayId} moved to ${timedOut ? "blocked" : "backlog"} (${failureReason})`);
+		log.warn(`run ${runId} ${timedOut ? "timed out" : "failed"}; T-${task.displayId} moved to ${movedTo} (${failureReason})`);
 		await notify({ kind: "task_failed", displayId: task.displayId, reason: failureReason });
 		if (timedOut) return { outcome: "timed_out", taskId: task.id, runId, sessionId: session.sessionId, worktreePath };
 		return { outcome: "failed", taskId: task.id, runId, sessionId: session.sessionId, worktreePath, failureReason };
@@ -698,18 +967,20 @@ async function settleAutoWorkRun(params: {
 	const shortSessionId = session.sessionId.slice(0, 8);
 
 	let prNumber: number | undefined;
+	let prStatus: "opened" | "already_open" | "failed" | undefined;
 	let prFailureReason: string | undefined;
 	try {
 		const pr = await createPullRequest({
 			cwd: worktreePath,
-			title: `feat: T-${task.displayId} ${task.title}`,
-			body: `Auto Work completed T-${task.displayId}: ${task.title}\n\nSession: ${sessionUrl}`,
+			...buildAutoWorkPrMessage(task, session.sessionId),
 		});
 		prNumber = pr.number;
-		log.info(`run ${runId}: opened PR #${pr.number} (${pr.url}) for T-${task.displayId}`);
+		prStatus = pr.prStatus;
+		log.info(`run ${runId}: ${pr.prStatus === "already_open" ? "found existing" : "opened"} PR #${pr.number} (${pr.url}) for T-${task.displayId}`);
 	} catch (err) {
-		const errMsg = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim().slice(0, 120);
+		const errMsg = ((err instanceof Error ? err.message : String(err)).split("\n")[0] ?? "").trim().slice(0, 120);
 		prFailureReason = errMsg;
+		prStatus = "failed";
 		log.error(`run ${runId}: gh pr create failed for T-${task.displayId}`, err);
 
 		// When gh pr create fails with a "no commits" pattern, the agent
@@ -725,15 +996,20 @@ async function settleAutoWorkRun(params: {
 			if (!hasCommits) {
 				const failureReason = `agent produced no commits (PR: ${errMsg})`;
 				completeAutoWorkRun(runId, { status: "failed", failureReason, inputTokens, outputTokens, pctConsumed });
-				const backlogState = findStateByName("backlog");
-				if (backlogState) moveTask(task.id, backlogState.id, 0);
+				const routing = routeTaskAfterFailedRun(task.id);
 				broadcastBus.broadcast({ type: "tasks_changed" });
 				broadcastBus.broadcast({ type: "auto_work_runs_changed" });
+				// T-100: release the live handle — this run is written off.
+				try {
+					await session.dispose();
+				} catch (disposeErr) {
+					log.warn(`run ${runId}: dispose of failed session failed`, disposeErr);
+				}
 				updateTask(task.id, {
-					body: `${task.body}\n\n---\n**Auto Work aborted** — run \`${runId}\` ${failureReason}. Session: \`${session.sessionId}\`, worktree: \`${worktreePath}\`.`,
+					body: `${task.body}\n\n---\n**Auto Work aborted** — run \`${runId}\` ${failureReason}. ${describeRetryDecision(routing)}. Session: \`${session.sessionId}\`, worktree: \`${worktreePath}\`.`,
 				});
 				broadcastBus.broadcast({ type: "tasks_changed" });
-				log.warn(`run ${runId} failed (no agent commits); T-${task.displayId} moved to backlog (${failureReason})`);
+				log.warn(`run ${runId} failed (no agent commits); T-${task.displayId} moved to ${routing.targetStateName} (${failureReason})`);
 				await notify({ kind: "task_failed", displayId: task.displayId, reason: failureReason });
 				return { outcome: "failed", taskId: task.id, runId, sessionId: session.sessionId, worktreePath, failureReason };
 			}
@@ -759,43 +1035,58 @@ async function settleAutoWorkRun(params: {
 		updateTask(task.id, {
 			body: appendAgentHistoryEntry(task.body + note, runId, new Date().toISOString(), `Session completed. PR #${prNumber} pending auto-merge.`),
 		});
-		const validateState = findStateByName("validate");
-		if (validateState) moveTask(task.id, validateState.id, 0);
+		const pendingValidateState = findStateByName("validate");
+		if (pendingValidateState) moveTask(task.id, pendingValidateState.id, 0);
 		completeAutoWorkRun(runId, { status: "completed_pending_merge", inputTokens, outputTokens, pctConsumed, prNumber });
 		broadcastBus.broadcast({ type: "tasks_changed" });
 		broadcastBus.broadcast({ type: "auto_work_runs_changed" });
 		log.info(`run ${runId}: T-${task.displayId} PR #${prNumber} pending auto-merge (native arm: ${autoMergeArmed})`);
 		await notify({ kind: "task_auto_merging", displayId: task.displayId, prNumber });
-		return { outcome: "completed", taskId: task.id, runId, sessionId: session.sessionId, worktreePath };
+		return { outcome: "completed", taskId: task.id, runId, sessionId: session.sessionId, worktreePath, prNumber, prStatus: prStatus ?? "opened" };
 	}
 
-	const completeRunNote =
+	const validateState = findStateByName("validate");
+	const validationRoutingReason = validateState ? undefined : "validate task state not found, task moved to blocked for manual review";
+	if (validateState) {
+		moveTask(task.id, validateState.id, 0);
+	} else {
+		const blockedState = findStateByName("blocked");
+		if (blockedState) moveTask(task.id, blockedState.id, 0);
+		else log.error(`run ${runId}: "validate" and "blocked" task states not found — T-${task.displayId} left in its current state`);
+	}
+
+	const completeRunNoteBase =
 		prNumber !== undefined
 			? `\n\n---\n**Auto Work** — [session ${shortSessionId}](${sessionUrl}) · PR #${prNumber}`
 			: `\n\n---\n**Auto Work — implementation complete, PR creation failed**\n[session ${shortSessionId}](${sessionUrl}) · run \`${runId}\`\n\n**Error:** ${prFailureReason}\n\nRetry with \`POST /auto-work/runs/${runId}/create-pr\`, or run \`gh pr create\` manually from \`${worktreePath}\`.`;
-	const completeHistorySummary =
+	const completeRunNote = validationRoutingReason
+		? `${completeRunNoteBase}\n\n**Auto Work routing:** ${validationRoutingReason}.`
+		: completeRunNoteBase;
+	const completeHistorySummaryBase =
 		prNumber !== undefined
 			? `Session completed. PR #${prNumber}.`
 			: `Session completed. PR creation failed: ${prFailureReason}.`;
+	const completeHistorySummary = validationRoutingReason
+		? `${completeHistorySummaryBase} ${validationRoutingReason}.`
+		: completeHistorySummaryBase;
 	updateTask(task.id, {
 		body: appendAgentHistoryEntry(task.body + completeRunNote, runId, new Date().toISOString(), completeHistorySummary),
 	});
 
-	const validateState = findStateByName("validate");
-	if (validateState) moveTask(task.id, validateState.id, 0);
-	else log.error(`run ${runId}: "validate" task state not found — T-${task.displayId} left in its current state`);
-
+	const completionFailureReason = `${prFailureReason ? `${prFailureReason} ` : ""}${validationRoutingReason ?? ""}`.trim() || null;
 	completeAutoWorkRun(runId, {
 		status: prNumber !== undefined ? "completed" : "completed_pr_failed",
 		inputTokens,
 		outputTokens,
 		pctConsumed,
-		failureReason: prFailureReason ?? null,
+		failureReason: completionFailureReason,
 		prNumber: prNumber ?? null,
 	});
 	broadcastBus.broadcast({ type: "tasks_changed" });
 	broadcastBus.broadcast({ type: "auto_work_runs_changed" });
-	log.info(`run ${runId} completed for T-${task.displayId} — moved to validate${prNumber === undefined ? " (PR creation failed)" : ""}`);
+	log.info(
+		`run ${runId} completed for T-${task.displayId} — moved to ${validateState ? "validate" : "blocked"}${prNumber === undefined ? " (PR creation failed)" : ""}`,
+	);
 	// A real PR announces success; a PR-creation failure still gets its own
 	// (quieter) notification kind so it's visible without being confused
 	// with a genuine completion (T-85) — unlike the no-commits case above,
@@ -805,7 +1096,7 @@ async function settleAutoWorkRun(params: {
 	} else if (prFailureReason !== undefined) {
 		await notify({ kind: "task_completed_pr_failed", displayId: task.displayId, reason: prFailureReason });
 	}
-	return { outcome: "completed", taskId: task.id, runId, sessionId: session.sessionId, worktreePath };
+	return { outcome: "completed", taskId: task.id, runId, sessionId: session.sessionId, worktreePath, prNumber, prStatus: prStatus ?? "failed", ...(prFailureReason !== undefined ? { prFailureReason } : {}) };
 }
 
 /**
@@ -834,8 +1125,10 @@ export async function reconcileInactiveAutoWorkRuns(bridge: AgentBridge, now = D
 			continue;
 		}
 		if (stillLive) continue;
-		failAutoWorkRun(run.id, run.taskId, "session_not_running");
-		log.warn(`run ${run.id} (session ${run.sessionId}) is no longer running; moved task back to backlog`);
+		const routing = failAutoWorkRun(run.id, run.taskId, "session_not_running");
+		log.warn(
+			`run ${run.id} (session ${run.sessionId}) is no longer running; task moved to ${routing.targetStateName}${routing.exhausted ? " (MAX_RETRIES_EXCEEDED)" : ""}`,
+		);
 		reconciled += 1;
 	}
 	return reconciled;
@@ -949,18 +1242,29 @@ async function resumeOrRetireAutoWorkRun(
 		usageLookup: () => Promise<{ available: boolean; weeklyPct?: number }>;
 	},
 ): Promise<AutoWorkCycleResult | undefined> {
-	const handle = await resolveRunningSessionHandle(bridge, run);
+	let handle: SessionHandle | undefined;
+	try {
+		handle = await resolveRunningSessionHandle(bridge, run);
+	} catch (err) {
+		// T-105: a resume failure (corrupt transcript, bridge error) must not
+		// leave the row `running` — that wedges the workspace mutex and stops
+		// Auto Work entirely. Close the run as failed (the normal retry budget
+		// applies) and let this cycle fall through to fresh task selection.
+		const msg = ((err instanceof Error ? err.message : String(err)).split("\n")[0] ?? "").trim().slice(0, 160);
+		const routing = failAutoWorkRun(run.id, run.taskId, `session_resume_failed: ${msg}`);
+		log.warn(
+			`run ${run.id}: resuming session ${run.sessionId} failed (${msg}) — run marked failed, task moved to ${routing.targetStateName}${routing.exhausted ? " (MAX_RETRIES_EXCEEDED)" : ""}`,
+		);
+		return undefined;
+	}
 	const worktreeExists = fs.existsSync(run.worktreePath);
 	const classification = classifyRunningAutoWorkRun(run, handle !== undefined, worktreeExists);
 
 	if (classification === "stale" || !handle) {
+		const routing = failAutoWorkRun(run.id, run.taskId, "session_lost");
 		log.warn(
-			`run ${run.id} (session ${run.sessionId}) has no live or persisted session to resume — marking failed and returning the task to backlog`,
+			`run ${run.id} (session ${run.sessionId}) has no live or persisted session to resume — marked failed, task moved to ${routing.targetStateName}${routing.exhausted ? " (MAX_RETRIES_EXCEEDED)" : ""}`,
 		);
-		completeAutoWorkRun(run.id, { status: "failed", failureReason: "session_lost" });
-		broadcastBus.broadcast({ type: "auto_work_runs_changed" });
-		const backlogState = findStateByName("backlog");
-		if (backlogState) moveTask(run.taskId, backlogState.id, 0);
 		await removeAutoWorkWorktree(cwd, run.worktreePath);
 		return undefined;
 	}
@@ -1039,6 +1343,7 @@ function stopReasonFromEvent(event: { message?: unknown; messages?: unknown; sto
 	return undefined;
 }
 
+
 function terminalOutcomeFromEvent(event: unknown): AutoWorkTerminalResult | undefined {
 	if (!event || typeof event !== "object" || !("type" in event)) return undefined;
 	if (event.type !== "turn_end" && event.type !== "agent_end") return undefined;
@@ -1048,11 +1353,28 @@ function terminalOutcomeFromEvent(event: unknown): AutoWorkTerminalResult | unde
 	// An intermediate `turn_end` inside a multi-tool-call task — the agent is
 	// still working towards `agent_end`, not actually done yet.
 	if (event.type === "turn_end" && stopReason && TOOL_CONTINUATION_STOP_REASONS[stopReason]) return undefined;
+	if (stopReason === "aborted") {
+		// TTSR deliberately aborts a stream, injects the matched rule, and retries
+		// it within the same agent turn. Its local abort reason is propagated as
+		// `errorMessage`, so wait for the retry's actual terminal outcome.
+		const candidates = [
+			event,
+			"message" in event ? event.message : undefined,
+			...("messages" in event && Array.isArray(event.messages) ? event.messages : []),
+		];
+		const ttsrInterruption = candidates.some((candidate) => {
+			if (!candidate || typeof candidate !== "object" || !("errorMessage" in candidate)) return false;
+			return typeof candidate.errorMessage === "string" && candidate.errorMessage.startsWith("TTSR matched rule");
+		});
+		if (ttsrInterruption) return undefined;
+	}
+
 
 	if (!stopReason) return { outcome: "failed", failureReason: "agent turn ended without a stop reason" };
 	if (stopReason === "end_turn" || stopReason === "stop") return { outcome: "completed" };
 	return { outcome: "failed", failureReason: `agent turn ended with stop reason: ${stopReason}` };
 }
+
 
 /**
  * Wait for a terminal event while retaining the exact failure condition for
@@ -1117,11 +1439,20 @@ export async function waitForAutoWorkSessionTerminal(
  * the matching project policy before the remote default, never from the
  * currently checked-out branch in the main worktree. This keeps every
  * auto-work branch on the configured clean base regardless of local checkout.
+ *
+ * Every linked worktree shares the main checkout's `.git/config` (this repo
+ * does not opt into `extensions.worktreeConfig`), so a stray repo-local
+ * `user.name`/`user.email` silently overrides the real committer identity
+ * for EVERY worktree, not just the one it was set from. `stripLocalGitIdentityOverride`
+ * runs on every call — including the reused-worktree fast path — so commit
+ * authorship always falls through to whatever is configured globally.
  */
 async function createAutoWorkWorktree(repoCwd: string, task: Task, slug: string): Promise<string> {
 	const dirName = `aw-T${task.displayId}-${slug}`;
 	const worktreePath = path.join(repoCwd, ".worktrees", dirName);
 	const branch = `auto-work/t${task.displayId}-${slug}`;
+
+	await stripLocalGitIdentityOverride(repoCwd);
 
 	// Reuse an existing registered worktree rather than failing with exit 255
 	// when a previous run left the branch/path in place (retry or crashed session).
@@ -1159,6 +1490,36 @@ async function createAutoWorkWorktree(repoCwd: string, task: Task, slug: string)
 		throw new Error(`git worktree add failed (exit ${exitCode}) for T-${task.displayId}: ${stderr.trim()}`);
 	}
 	return worktreePath;
+}
+
+/**
+ * Removes any repo-local `user.name`/`user.email` override so commit
+ * authorship always resolves to the global git identity. A local override
+ * here is never intentional: it silently attributes every future commit,
+ * in every worktree (including the user's own main checkout), to whatever
+ * it was set to instead of the real committer — this is exactly what
+ * happened when a repo-local `agent <agent@omp-deck.local>` identity ended
+ * up in `.git/config`. `git config --unset-all` exits 5 when the key is
+ * already absent, which is the common case and not an error here.
+ */
+async function stripLocalGitIdentityOverride(repoCwd: string): Promise<void> {
+	for (const key of ["user.name", "user.email"]) {
+		const proc = Bun.spawn(["git", "config", "--local", "--unset-all", key], {
+			cwd: repoCwd,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+			windowsHide: true,
+		});
+		const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+		// Exit 0 = removed, 5 = key was already absent (the common case) —
+		// both are fine. Anything else (lock contention, a malformed config)
+		// means the override may still be sitting there, so surface it instead
+		// of silently proceeding with a possibly-still-poisoned identity.
+		if (exitCode !== 0 && exitCode !== 5) {
+			log.warn(`failed to strip local git ${key} override in ${repoCwd} (exit ${exitCode}): ${stderr.trim()}`);
+		}
+	}
 }
 
 /**
@@ -1282,6 +1643,24 @@ export interface CreatePullRequestParams {
 export interface CreatePullRequestResult {
 	url: string;
 	number: number;
+	/** Whether the engine opened a fresh PR or found one the agent had already created. */
+	prStatus: "opened" | "already_open";
+}
+
+/**
+ * Builds the PR title/body Auto Work sends to `gh pr create` (T-119).
+ * Deliberately does NOT embed the deck session URL (or any other link) — a
+ * public GitHub PR description is not the place for a link into the deck's
+ * own (often `localhost`, or otherwise internal) UI. The session stays
+ * traceable through its short id instead; the full clickable link lives
+ * only in the task's kanban-card note (`completeRunNote` below), which
+ * never leaves the deck.
+ */
+export function buildAutoWorkPrMessage(task: Pick<Task, "displayId" | "title">, sessionId: string): { title: string; body: string } {
+	return {
+		title: `feat: T-${task.displayId} ${task.title}`,
+		body: `Auto Work completed T-${task.displayId}: ${task.title}\n\nSession: ${sessionId.slice(0, 8)}`,
+	};
 }
 
 export interface ArmAutoMergeParams {
@@ -1379,28 +1758,103 @@ function describeGhFailure(stderr: string): string {
 }
 
 /**
+ * Pushes the current branch to `origin` and sets the upstream tracking ref.
+ * Idempotent — "Everything up-to-date" is success. Must run before
+ * `gh pr create` so the head ref exists on GitHub even when the agent
+ * didn't push during its own turn.
+ */
+async function gitPushSetUpstream(cwd: string): Promise<void> {
+	let proc: Subprocess<"ignore", "pipe", "pipe">;
+	try {
+		proc = Bun.spawn(
+			["git", "push", "--set-upstream", "origin", "HEAD"],
+			{ cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true },
+		);
+	} catch (err) {
+		const cause = err instanceof Error ? err.message : String(err);
+		throw new Error(`git push --set-upstream origin HEAD failed to spawn: ${cause}`);
+	}
+	const [, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	if (exitCode !== 0) {
+		throw new Error(`git push --set-upstream origin HEAD failed (exit ${exitCode}): ${stderr.trim()}`);
+	}
+}
+
+/**
+ * Finds an open PR for the current branch via `gh pr view`. Used to recover
+ * gracefully when the agent already opened the PR during its turn and
+ * `gh pr create` would fail with "already exists".
+ * Returns `undefined` when `gh pr view` fails for any reason (no PR, no auth,
+ * network error) so the caller can fall through to the normal error path.
+ */
+async function findExistingPullRequest(cwd: string): Promise<{ url: string; number: number } | undefined> {
+	try {
+		const proc = Bun.spawn(
+			["gh", "pr", "view", "--json", "number,url"],
+			{ cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true },
+		);
+		const [stdout, , exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (exitCode !== 0) return undefined;
+		const parsed = JSON.parse(stdout) as { number: number; url: string };
+		if (typeof parsed.number !== "number" || typeof parsed.url !== "string") return undefined;
+		return { number: parsed.number, url: parsed.url };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The diff the branch would introduce against its resolved base — the same
+ * input a GitHub PR review would show. Scoped to `assertNoSecretsInDiff`
+ * (T-119): scanned for credential-shaped ADDED content before the branch is
+ * pushed or a PR is opened.
+ */
+async function diffAgainstBase(cwd: string, baseBranch: string): Promise<string> {
+	const proc = Bun.spawn(
+		["git", "diff", `origin/${baseBranch}...HEAD`],
+		{ cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true },
+	);
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	if (exitCode !== 0) {
+		// Fails closed — an unreadable diff must not silently skip the secret
+		// scan, so this surfaces as an actionable PR-creation failure instead.
+		throw new Error(`git diff origin/${baseBranch}...HEAD failed (exit ${exitCode}): ${stderr.trim()}`);
+	}
+	return stdout;
+}
+
+/**
  * `gh pr create --base <base-branch> --title <title> --body <body>`, run from
  * the worktree directory so `gh` infers the PR head from the checked-out task
  * branch. The same project-aware base resolver used by worktree creation and
  * commit detection also covers explicit PR retries through this function.
  */
 export async function createPullRequestViaGh(params: CreatePullRequestParams): Promise<CreatePullRequestResult> {
-	const baseBranch = await resolveBaseBranch(params.cwd);
+	// Message guard first — cheap, synchronous, and 100% engine-controlled
+	// input, so there's no reason to pay for a diff/push before catching it.
+	assertNoSensitiveContent("PR title", params.title);
+	assertNoSensitiveContent("PR body", params.body);
 
-	// `gh pr create` runs with stdin ignored, so it cannot interactively push
-	// an unpushed branch and aborts with "you must first push the current
-	// branch". Push first — a no-op when the agent session already pushed.
-	const push = Bun.spawn(["git", "push", "-u", "origin", "HEAD"], {
-		cwd: params.cwd,
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
-		windowsHide: true,
-	});
-	const [pushStderr, pushExit] = await Promise.all([new Response(push.stderr).text(), push.exited]);
-	if (pushExit !== 0) {
-		throw new Error(`git push failed before gh pr create (exited ${pushExit}): ${pushStderr.trim()}`);
-	}
+	const baseBranch = await resolveBaseBranch(params.cwd);
+	// Diff guard before the push below — nothing the branch adds reaches
+	// `origin` (or a public PR) once this rejects (T-119).
+	assertNoSecretsInDiff(await diffAgainstBase(params.cwd, baseBranch));
+
+	// Push only after both guards pass. Idempotent — "Everything up-to-date"
+	// is success — so this stays safe to call twice on retry.
+	await gitPushSetUpstream(params.cwd);
 
 	let proc: Subprocess<"ignore", "pipe", "pipe">;
 	try {
@@ -1418,12 +1872,15 @@ export async function createPullRequestViaGh(params: CreatePullRequestParams): P
 		proc.exited,
 	]);
 	if (exitCode !== 0) {
-		// The agent session may have opened the PR itself during its run —
-		// that's a success, not a failure: recover the existing PR instead of
-		// closing the run as `completed_pr_failed`.
-		if (/already exists/i.test(stderr) && /pull request/i.test(stderr)) {
-			const existing = await lookupExistingPullRequest(params.cwd);
-			if (existing) return existing;
+		// Idempotent recovery: if the agent already opened a PR during its turn,
+		// find and return it instead of failing. `gh pr view` looks up the open
+		// PR for the current branch without creating a duplicate.
+		// Case-insensitive to match both "pull request already exists" and
+		// "A pull request ... already exists" forms from different gh versions.
+		const stderrLower = stderr.toLowerCase();
+		if (stderrLower.includes("already exists") && stderrLower.includes("pull request")) {
+			const existing = await findExistingPullRequest(params.cwd);
+			if (existing) return { ...existing, prStatus: "already_open" };
 		}
 		throw new Error(`${describeGhFailure(stderr)} (gh pr create exited ${exitCode}): ${stderr.trim()}`);
 	}
@@ -1432,27 +1889,7 @@ export async function createPullRequestViaGh(params: CreatePullRequestParams): P
 	if (!match) {
 		throw new Error(`gh pr create succeeded but its output didn't contain a PR URL: ${stdout.trim()}`);
 	}
-	return { url, number: Number(match[1]) };
-}
-
-/** Resolves the already-open PR for the checked-out branch, or `undefined` if `gh pr view` can't find one. */
-async function lookupExistingPullRequest(cwd: string): Promise<CreatePullRequestResult | undefined> {
-	const proc = Bun.spawn(["gh", "pr", "view", "--json", "number,url"], {
-		cwd,
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
-		windowsHide: true,
-	});
-	const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-	if (exitCode !== 0) return undefined;
-	try {
-		const parsed = JSON.parse(stdout) as { number?: number; url?: string };
-		if (typeof parsed.number === "number" && typeof parsed.url === "string") return { url: parsed.url, number: parsed.number };
-	} catch {
-		// Unparseable gh output — fall through to the original create error.
-	}
-	return undefined;
+	return { url, number: Number(match[1]), prStatus: "opened" };
 }
 
 // ─── Auto-merge (fully-autonomous mode) ──────────────────────────────────────
@@ -1764,43 +2201,48 @@ export async function runGlobalAutoWorkCycle(
 	const usage = await usageLookup();
 	const subscriptionPctUsed = usage.available && typeof usage.weeklyPct === "number" ? usage.weeklyPct : null;
 	const sessionPctUsed = usage.available && typeof usage.sessionPct === "number" ? usage.sessionPct : null;
+	const resolveDeckBaseUrl = options.getDeckBaseUrl ?? (() => getServerDeckBaseUrl(loadConfig()).deckBaseUrl);
+	const createPullRequest = options.createPullRequest ?? createPullRequestViaGh;
+	const notify = options.notify ?? sendAutoWorkNotification;
 
-	const allTasks = listTasks();
 	const backlogState = findStateByName("backlog");
 	const doneState = findStateByName("done");
 	if (!backlogState || !doneState) {
 		return { outcome: "skipped", reason: "backlog/done task states missing — cannot run auto-work" };
 	}
 
-	// Global Auto Work is deliberately sequential: a run this process is
-	// actively settling defers the cycle. But a `running` row this process is
-	// NOT settling (orphaned by a server restart) must be resumed or retired
-	// here — the resume path lives in the per-workspace cycle, which this
-	// mutex would otherwise never let us reach again (permanent deadlock).
-	const runningRuns = listAutoWorkRuns({ status: "running" });
-	if (runningRuns.length > 0) {
-		const orphan = runningRuns.find(
-			(r) => !activeRunIds.has(r.id) && now.getTime() - Date.parse(r.startedAt) >= STALE_RUN_GRACE_MS,
-		);
-		if (!orphan) {
-			return { outcome: "skipped", reason: "another auto-work run is already active" };
+	// A `running` row surviving a restart (T-106): `activeRunIds` is this
+	// process's authoritative "a finalizer is actually watching this run"
+	// signal, so any running row missing from it is orphaned rather than
+	// genuinely in flight. Route it through the owning workspace's
+	// resume/retire path instead of wedging the global mutex forever.
+	const orphanRun = listAutoWorkRuns({ status: "running" }).find((r) => !activeRunIds.has(r.id));
+	if (orphanRun) {
+		const orphanTask = getTask(orphanRun.taskId);
+		if (orphanTask?.cwd) {
+			const resumed = await resumeOrRetireAutoWorkRun(
+				orphanTask.cwd,
+				bridge,
+				orphanRun,
+				getAutoWorkConfig(orphanTask.cwd),
+				{ resolveDeckBaseUrl, createPullRequest, armAutoMerge: options.armAutoMerge ?? armAutoMergeViaGh, notify, usageLookup },
+			);
+			if (resumed) return resumed;
+		} else {
+			const routing = failAutoWorkRun(orphanRun.id, orphanRun.taskId, "session_lost");
+			log.warn(
+				`global cycle: run ${orphanRun.id} has no resolvable task/cwd — marked failed${routing.exhausted ? " (MAX_RETRIES_EXCEEDED)" : ""}`,
+			);
 		}
-		const orphanCwd = getTask(orphan.taskId)?.cwd;
-		if (!orphanCwd) {
-			// Nothing to resume under — close it out rather than deadlocking.
-			completeAutoWorkRun(orphan.id, { status: "failed", failureReason: "task no longer exists" });
-			broadcastBus.broadcast({ type: "auto_work_runs_changed" });
-			return { outcome: "skipped", reason: `closed orphaned run ${orphan.id} (its task is gone); next cycle proceeds` };
-		}
-		log.info(`global cycle: run ${orphan.id} is orphaned (server restart?) — delegating to ${orphanCwd} for resume-or-retire`);
-		return runAutoWorkCycle(orphanCwd, bridge, {
-			...options,
-			now: () => now,
-			getSubscriptionUsage: () => Promise.resolve(usage),
-			generateBranchSlug:
-				options.generateBranchSlug ?? ((task) => generateBranchSlugWithModel(bridge, orphanCwd, task, options.taskSelectionModel ?? null)),
-		});
 	}
+
+	// Global Auto Work is deliberately sequential: a genuinely live run
+	// anywhere still defers this cycle, rather than starting work elsewhere.
+	if (listAutoWorkRuns({ status: "running" }).length > 0) {
+		return { outcome: "skipped", reason: "another auto-work run is already active" };
+	}
+
+	const allTasks = listTasks();
 
 	// Collect distinct enabled cwds from all auto-work–flagged tasks.
 	const enabledCwds = new Set<string>();
@@ -1810,17 +2252,31 @@ export async function runGlobalAutoWorkCycle(
 		if (config.enabled) enabledCwds.add(t.cwd);
 	}
 
+	// Auto-work backlog tasks without a workspace can never run — the task
+	// write paths reject that state now, but pre-existing rows (or direct DB
+	// edits) must be loudly visible instead of silently ignored.
+	const orphaned = allTasks.filter((t) => t.autoWork && t.stateId === backlogState.id && !t.cwd?.trim());
+	const orphanNote =
+		orphaned.length > 0
+			? `${orphaned.length} auto-work task(s) have no workspace (cwd) and were ignored: ${orphaned
+					.map((t) => `T-${t.displayId}`)
+					.join(", ")} — set a cwd on the task card`
+			: undefined;
+	if (orphanNote) log.warn(`global cycle: ${orphanNote}`);
+
 	if (enabledCwds.size === 0) {
-		return { outcome: "skipped", reason: "no workspace has auto-work enabled" };
+		const reason = orphanNote
+			? `no workspace has auto-work enabled — ${orphanNote}`
+			: "no workspace has auto-work enabled";
+		log.info(`global cycle skipped: ${reason}`);
+		return { outcome: "skipped", reason };
 	}
 
 	// Per-workspace: preflight + task selection.
 	const tasksById = new Map(allTasks.map((t) => [t.id, t]));
 
 	const candidates: GlobalAutoWorkCandidate[] = [];
-	// Per-workspace skip causes, surfaced in the skip reason so a manual
-	// trigger explains WHY nothing ran (budget vs window vs no tasks).
-	const skipDetails: string[] = [];
+	const workspaceSkips: string[] = [];
 
 	for (const cwd of enabledCwds) {
 		const config = getAutoWorkConfig(cwd);
@@ -1830,8 +2286,7 @@ export async function runGlobalAutoWorkCycle(
 		});
 		const preflight = checkAutoWorkPreflight({ config, now, subscriptionPctUsed, sessionPctUsed, activeRuns });
 		if (!preflight.ok) {
-			log.debug(`global cycle: ${cwd} skipped (${preflight.reason})`);
-			skipDetails.push(`${cwd}: ${preflight.reason}`);
+			workspaceSkips.push(`${cwd}: ${preflight.reason}`);
 			continue;
 		}
 		const cwdTasks = allTasks.filter((t) => t.cwd === cwd);
@@ -1845,20 +2300,20 @@ export async function runGlobalAutoWorkCycle(
 		});
 		if (selection.kind === "selected") {
 			candidates.push({ workspaceCwd: cwd, task: selection.task, estimatedCostPct: selection.estimatedCostPct });
+		} else if (selection.kind === "none_eligible") {
+			workspaceSkips.push(`${cwd}: no eligible auto-work tasks in backlog`);
 		} else if (selection.kind === "none_fit") {
-			skipDetails.push(
-				`${cwd}: ${selection.consideredCount} eligible task(s), but none fit the weekly budget (${subscriptionPctUsed ?? 0}% used, limit ${config.weeklyPctLimit}%)`,
-			);
-		} else {
-			skipDetails.push(`${cwd}: no eligible backlog task`);
+			workspaceSkips.push(`${cwd}: ${selection.consideredCount} eligible task(s) exceed the current budget`);
 		}
 	}
 
 	if (candidates.length === 0) {
-		return {
-			outcome: "skipped",
-			reason: skipDetails.length > 0 ? skipDetails.join("; ") : "no eligible task fits the current budget across all workspaces",
-		};
+		const details = [...workspaceSkips, ...(orphanNote ? [orphanNote] : [])].join(" / ");
+		const reason = details
+			? `no runnable auto-work task: ${details}`
+			: "no eligible task fits the current budget across all workspaces";
+		log.info(`global cycle skipped: ${reason}`);
+		return { outcome: "skipped", reason };
 	}
 
 	// Priority remains the deterministic fallback. A selector only runs after
@@ -1885,6 +2340,7 @@ export async function runGlobalAutoWorkCycle(
 		...options,
 		now: () => now,
 		getSubscriptionUsage: () => Promise.resolve(cachedUsage),
+		pinnedTaskId: winner.task.id,
 		generateBranchSlug:
 			options.generateBranchSlug ??
 			((task) => generateBranchSlugWithModel(bridge, winner.workspaceCwd, task, options.taskSelectionModel ?? null)),

@@ -1,4 +1,4 @@
--- 021-auto-work-auto-merge.sql
+-- 025-auto-work-auto-merge.sql
 --
 -- Fully-autonomous mode. `auto_work_config.auto_merge` opts a workspace into
 -- arming GitHub auto-merge on a successful run's PR (CI is the reviewer) and

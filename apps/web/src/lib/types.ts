@@ -88,6 +88,8 @@ export interface NoticeMsg {
 	role: "notice";
 	level: "info" | "warning" | "error";
 	message: string;
+	/** Secondary detail, e.g. from a `notification` frame's `body` field. */
+	body?: string;
 	source?: string;
 	timestamp: number;
 }
@@ -117,6 +119,41 @@ export interface IrcMsg {
 	timestamp: number;
 }
 
+/**
+ * Live transition marker (T-32) — rendered inline at the moment the SDK's
+ * auto-handoff compaction strategy swaps this session onto a brand-new
+ * file+id. From the deck's synthetic `session_handoff` event, never
+ * persisted by the SDK — a page reload after this fires still shows it
+ * because the live handle keeps emitting the underlying session's messages
+ * into the SAME subscription (see server `bridge/in-process.ts` docs), but
+ * a reload against a DIFFERENT process (server restart) loses it — the
+ * complementary `HandoffOriginMsg` below covers that case from the new
+ * session's side.
+ */
+export interface HandoffMsg {
+	id: string;
+	role: "handoff";
+	reason: string;
+	previousSessionId: string;
+	previousSessionFile?: string;
+	newSessionId: string;
+	newSessionFile?: string;
+	timestamp: number;
+}
+
+/**
+ * Persisted marker (T-32) — the transferred summary a session began with
+ * because it continues an earlier one via auto-handoff. Reconstructed from
+ * the SDK's own `role: "custom", customType: "handoff"` transcript entry,
+ * so it survives reloads and server restarts alike.
+ */
+export interface HandoffOriginMsg {
+	id: string;
+	role: "handoff_origin";
+	document: string;
+	timestamp: number;
+}
+
 export type ChatMessage =
 	| UserMsg
 	| AssistantMsg
@@ -124,7 +161,9 @@ export type ChatMessage =
 	| NoticeMsg
 	| CompactionMsg
 	| TtsrMsg
-	| IrcMsg;
+	| IrcMsg
+	| HandoffMsg
+	| HandoffOriginMsg;
 
 // ─── Queued prompts (sent while agent was streaming) ──────────────────────
 
@@ -194,6 +233,8 @@ export interface SessionUi {
 	cwd: string;
 	sessionFile?: string;
 	sessionName?: string;
+	/** Set when this session itself is a fork/handoff of another session (T-31). */
+	parentSessionPath?: string;
 	model?: ModelRef;
 	thinkingLevel?: string;
 

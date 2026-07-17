@@ -41,6 +41,7 @@ The same directory holds:
 | `OMP_DECK_PORT` | `8787` | yes | HTTP + WebSocket port. |
 | `OMP_DECK_WEB_PORT` | `5173` | yes | Vite dev server port (dev only). Proxies `/api` and `/ws` to `OMP_DECK_PORT`. |
 | `OMP_DECK_API_BASE` | derived | no | Loopback URL standalone bridge processes use. Derived from host+port when unset. |
+| `OMP_DECK_TITLE` | `omp-deck` | yes | Visible title in the upper-left corner of the web interface. |
 
 ### Workspaces
 

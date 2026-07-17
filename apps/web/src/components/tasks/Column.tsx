@@ -17,6 +17,7 @@ interface Props {
 	projectColors: ProjectColorMap;
 	onCreate: (stateId: string, title: string) => void;
 	onOpen: (task: Task) => void;
+	onPickCwd?: (task: Task) => void;
 	onRenameRequest?: (state: TaskState) => void;
 	isDraggingColumns: boolean;
 }
@@ -42,6 +43,7 @@ export function Column({
 	projectColors,
 	onCreate,
 	onOpen,
+	onPickCwd,
 	onRenameRequest,
 	isDraggingColumns,
 }: Props) {
@@ -134,6 +136,7 @@ export function Column({
 								key={t.id}
 								task={t}
 								onOpen={onOpen}
+								onPickCwd={onPickCwd}
 								projectColor={projectColorForCwd(t.cwd, projectColors)}
 							/>
 						))}

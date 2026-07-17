@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -37,7 +37,7 @@ export function buildFsRouter(): Hono {
 		// authorization. A bug in another route shouldn't let the picker walk
 		// `C:\Windows`.
 		if (!isCwdAllowed(cwd)) {
-			return c.json({ error: "cwd is not under an allowed root" }, 403);
+			return c.json({ error: cwdNotAllowedMessage() }, 403);
 		}
 
 		const cached = inventoryCache.get(cwd);
@@ -69,7 +69,7 @@ export function buildFsRouter(): Hono {
 		const requested = raw ? path.resolve(raw) : path.resolve(resolveHome());
 
 		if (!isCwdAllowed(requested)) {
-			return c.json({ error: "path is not under an allowed root" }, 403);
+			return c.json({ error: pathNotAllowedMessage() }, 403);
 		}
 
 		let dirs: string[];
@@ -276,6 +276,17 @@ function resolveHome(): string {
 	return process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
 }
 
+export const ALLOWED_WORKSPACE_ROOTS_GUIDANCE =
+	"Configure additional workspace roots in Settings → Env → OMP_DECK_WORKSPACES.";
+
+export function cwdNotAllowedMessage(): string {
+	return `cwd is not an allowed workspace. It must be an existing directory under $HOME or a root in OMP_DECK_WORKSPACES. ${ALLOWED_WORKSPACE_ROOTS_GUIDANCE}`;
+}
+
+export function pathNotAllowedMessage(label = "path"): string {
+	return `${label} is not under an allowed workspace root. ${ALLOWED_WORKSPACE_ROOTS_GUIDANCE}`;
+}
+
 export function isCwdAllowed(cwd: string): boolean {
 	// Allow cwds under $HOME or under any root listed in OMP_DECK_WORKSPACES.
 	// The deck is loopback-only, but a buggy client shouldn't be able to probe
@@ -284,23 +295,33 @@ export function isCwdAllowed(cwd: string): boolean {
 	try {
 		const resolved = path.resolve(cwd);
 		if (!(existsSync(resolved) && statSync(resolved).isDirectory())) return false;
+		// Compare canonical paths rather than lexical paths. A directory symlink
+		// below an allowed root can otherwise escape it after path.resolve().
+		const canonicalCwd = realpathSync(resolved);
 
 		// Build the list of allowed roots: $HOME + each OMP_DECK_WORKSPACES entry.
-		const roots: string[] = [];
+		const rawRoots: string[] = [];
 		const home = resolveHome();
-		if (home) roots.push(path.resolve(home));
+		if (home) rawRoots.push(path.resolve(home));
 		const extra = (process.env.OMP_DECK_WORKSPACES ?? "")
 			.split(",")
 			.map((s) => s.trim())
 			.filter(Boolean)
 			.map((p) => path.resolve(p));
-		roots.push(...extra);
+		rawRoots.push(...extra);
 
+		const roots = rawRoots.flatMap((root) => {
+			try {
+				return [realpathSync(root)];
+			} catch {
+				return [];
+			}
+		});
 		if (roots.length === 0) return false;
 
 		return roots.some((root) => {
-			const rel = path.relative(root, resolved);
-			// Empty rel = resolved IS the root (exact match). Both are allowed.
+			const rel = path.relative(root, canonicalCwd);
+			// Empty rel = cwd IS the root (exact match). Both are allowed.
 			return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 		});
 	} catch {

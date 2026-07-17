@@ -119,4 +119,71 @@ describe("listSessionUsage", () => {
 		expect(result?.totalTokens).toBe(0);
 		expect(result?.costUsd).toBe(0);
 	});
+
+	test("derives accountLabel from the cwd path's final segment", async () => {
+		const filePath = writeTranscript("label.jsonl", []);
+		const summary: SessionSummary = {
+			id: "label",
+			path: filePath,
+			cwd: "/home/user/my-project",
+			createdAt: "2026-07-01T00:00:00Z",
+			updatedAt: "2026-07-01T00:00:00Z",
+			messageCount: 0,
+		};
+		const [result] = await listSessionUsage(fakeBridge([summary]), 20);
+		expect(result?.accountLabel).toBe("my-project");
+	});
+
+	test("extracts provider from first model_change entry (provider/modelId format)", async () => {
+		const filePath = writeTranscript("provider-mc.jsonl", [
+			{ type: "session", id: "p1" },
+			{ type: "model_change", id: "mc1", parentId: null, model: "anthropic/claude-opus-4-5" },
+			{ type: "message", message: { role: "assistant", usage: { totalTokens: 10, cost: { total: 0.001 } } } },
+		]);
+		const summary: SessionSummary = {
+			id: "p1",
+			path: filePath,
+			cwd: "/x",
+			createdAt: "2026-07-01T00:00:00Z",
+			updatedAt: "2026-07-01T00:00:00Z",
+			messageCount: 1,
+		};
+		const [result] = await listSessionUsage(fakeBridge([summary]), 20);
+		expect(result?.provider).toBe("anthropic");
+	});
+
+	test("falls back to provider field on first assistant message when no model_change present", async () => {
+		const filePath = writeTranscript("provider-fallback.jsonl", [
+			{ type: "session", id: "p2" },
+			{ type: "message", message: { role: "user", content: "hello" } },
+			{ type: "message", message: { role: "assistant", provider: "openai-codex", usage: { totalTokens: 5 } } },
+		]);
+		const summary: SessionSummary = {
+			id: "p2",
+			path: filePath,
+			cwd: "/x",
+			createdAt: "2026-07-01T00:00:00Z",
+			updatedAt: "2026-07-01T00:00:00Z",
+			messageCount: 1,
+		};
+		const [result] = await listSessionUsage(fakeBridge([summary]), 20);
+		expect(result?.provider).toBe("openai-codex");
+	});
+
+	test("omits provider when transcript has neither model_change nor provider on assistant message", async () => {
+		const filePath = writeTranscript("no-provider.jsonl", [
+			{ type: "session", id: "p3" },
+			{ type: "message", message: { role: "assistant", usage: { totalTokens: 1 } } },
+		]);
+		const summary: SessionSummary = {
+			id: "p3",
+			path: filePath,
+			cwd: "/x",
+			createdAt: "2026-07-01T00:00:00Z",
+			updatedAt: "2026-07-01T00:00:00Z",
+			messageCount: 1,
+		};
+		const [result] = await listSessionUsage(fakeBridge([summary]), 20);
+		expect(result?.provider).toBeUndefined();
+	});
 });

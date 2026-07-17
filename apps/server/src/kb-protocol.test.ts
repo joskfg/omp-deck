@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { InternalUrlRouter, parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls";
 
 import { KbProtocolHandler } from "./kb-protocol.ts";
 
@@ -119,7 +119,7 @@ describe("kb:// resolution", () => {
 	});
 
 	test("absolute / drive-letter paths are rejected", async () => {
-		await expect(router.resolve("kb:///etc/passwd")).rejects.toThrow();
+		await expect(router.resolve("kb:///etc/passwd")).rejects.toThrow(/must be relative/);
 		await expect(router.resolve("kb://C:/Windows/System32")).rejects.toThrow();
 	});
 
@@ -135,5 +135,94 @@ describe("kb:// resolution", () => {
 	test("missing KB root yields an actionable error", async () => {
 		process.env.OMP_DECK_KB_ROOT = path.join(os.tmpdir(), "does-not-exist-here", String(Math.random()));
 		await expect(router.resolve("kb://anything")).rejects.toThrow(/OMP_DECK_KB_ROOT/);
+	});
+});
+
+describe("kb:// write", () => {
+	function kbHandler(): KbProtocolHandler {
+		return router.getHandler("kb") as KbProtocolHandler;
+	}
+
+	test("creates a new file at an explicit `.md` path", async () => {
+		await kbHandler().write(parseInternalUrl("kb://notes/topic.md"), "# Topic\n\nbody\n");
+		expect(readFileSync(path.join(kbRoot, "notes", "topic.md"), "utf8")).toBe("# Topic\n\nbody\n");
+	});
+
+	test("creates missing parent directories recursively", async () => {
+		await kbHandler().write(parseInternalUrl("kb://a/b/c/deep.md"), "deep\n");
+		expect(readFileSync(path.join(kbRoot, "a", "b", "c", "deep.md"), "utf8")).toBe("deep\n");
+	});
+
+	test("overwrites an existing file", async () => {
+		await kbHandler().write(parseInternalUrl("kb://system/working-voice.md"), "# Replaced\n");
+		expect(readFileSync(path.join(kbRoot, "system", "working-voice.md"), "utf8")).toBe("# Replaced\n");
+	});
+
+	test("extensionless path falls back to a `.md` target when nothing exists at the exact path", async () => {
+		await kbHandler().write(parseInternalUrl("kb://notes/fallback"), "content\n");
+		expect(readFileSync(path.join(kbRoot, "notes", "fallback.md"), "utf8")).toBe("content\n");
+	});
+
+	test("extensionless path overwrites an exact extensionless file when one already exists", async () => {
+		mkdirSync(path.join(kbRoot, "exact"), { recursive: true });
+		writeFileSync(path.join(kbRoot, "exact", "noext"), "old\n", "utf8");
+		await kbHandler().write(parseInternalUrl("kb://exact/noext"), "new\n");
+		expect(readFileSync(path.join(kbRoot, "exact", "noext"), "utf8")).toBe("new\n");
+	});
+
+	test("extensionless path whose direct name is an existing directory still falls back to `<path>.md`", async () => {
+		await kbHandler().write(parseInternalUrl("kb://system"), "index\n");
+		expect(readFileSync(path.join(kbRoot, "system.md"), "utf8")).toBe("index\n");
+	});
+
+	test("path traversal is rejected", async () => {
+		await expect(kbHandler().write(parseInternalUrl("kb://../etc/passwd"), "pwned\n")).rejects.toThrow(/traversal/);
+	});
+
+	test("absolute / drive-letter paths are rejected", async () => {
+		await expect(kbHandler().write(parseInternalUrl("kb:///etc/passwd"), "x")).rejects.toThrow(/must be relative/);
+		await expect(kbHandler().write(parseInternalUrl("kb://C:/Windows/System32/x.md"), "x")).rejects.toThrow();
+	});
+
+	test("a trailing-slash (directory) target is rejected", async () => {
+		await expect(kbHandler().write(parseInternalUrl("kb://system/"), "x")).rejects.toThrow(/directory/);
+	});
+
+	test("writing over an existing directory is rejected", async () => {
+		mkdirSync(path.join(kbRoot, "dirlikefile.md"));
+		await expect(kbHandler().write(parseInternalUrl("kb://dirlikefile.md"), "x")).rejects.toThrow(/directory/);
+	});
+
+	test("bare `kb://` is rejected", async () => {
+		await expect(kbHandler().write(parseInternalUrl("kb://"), "x")).rejects.toThrow(/file path/);
+	});
+
+	test("missing KB root yields an actionable error", async () => {
+		process.env.OMP_DECK_KB_ROOT = path.join(os.tmpdir(), "does-not-exist-here", String(Math.random()));
+		await expect(kbHandler().write(parseInternalUrl("kb://anything.md"), "x")).rejects.toThrow(/OMP_DECK_KB_ROOT/);
+	});
+
+	test("OMP_DECK_KB_ROOT override is honored on write", async () => {
+		const altRoot = mkdtempSync(path.join(os.tmpdir(), "omp-deck-kb-write-alt-"));
+		process.env.OMP_DECK_KB_ROOT = altRoot;
+		await kbHandler().write(parseInternalUrl("kb://alt/x.md"), "ALT\n");
+		expect(readFileSync(path.join(altRoot, "alt", "x.md"), "utf8")).toBe("ALT\n");
+	});
+
+	test("a symlinked ancestor escaping the KB root is rejected, not silently written through", async () => {
+		const outsideRoot = mkdtempSync(path.join(os.tmpdir(), "omp-deck-kb-write-outside-"));
+		symlinkSync(outsideRoot, path.join(kbRoot, "escape-link"), "dir");
+		await expect(kbHandler().write(parseInternalUrl("kb://escape-link/pwned.md"), "pwned\n")).rejects.toThrow(
+			/escapes KB root/,
+		);
+	});
+
+	test("a target that is itself a symlink escaping the KB root is rejected", async () => {
+		const outsideRoot = mkdtempSync(path.join(os.tmpdir(), "omp-deck-kb-write-outside-file-"));
+		const outsideFile = path.join(outsideRoot, "secret.md");
+		writeFileSync(outsideFile, "secret\n", "utf8");
+		symlinkSync(outsideFile, path.join(kbRoot, "escape.md"), "file");
+		await expect(kbHandler().write(parseInternalUrl("kb://escape.md"), "pwned\n")).rejects.toThrow(/escapes KB root/);
+		expect(readFileSync(outsideFile, "utf8")).toBe("secret\n");
 	});
 });

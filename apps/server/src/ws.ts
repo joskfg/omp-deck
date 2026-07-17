@@ -31,12 +31,13 @@ export class WsHub {
 	private readonly connections = new Set<ServerWebSocket<ConnectionData>>();
 	private readonly titledSessions = new Set<string>();
 	private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+	private unsubscribeBroadcastBus: (() => void) | null = null;
 
 	constructor(
 		private bridge: AgentBridge,
 		private skills: SkillsService,
 	) {
-		broadcastBus.subscribe((frame) => this.broadcast(frame));
+		this.unsubscribeBroadcastBus = broadcastBus.subscribe((frame) => this.broadcast(frame));
 		this.startHeartbeat();
 	}
 
@@ -85,6 +86,10 @@ export class WsHub {
 			clearInterval(this.heartbeatTimer);
 			this.heartbeatTimer = null;
 		}
+		if (this.unsubscribeBroadcastBus) {
+			this.unsubscribeBroadcastBus();
+			this.unsubscribeBroadcastBus = null;
+		}
 	}
 
 	createConnectionData(): ConnectionData {
@@ -110,67 +115,76 @@ export class WsHub {
 			return;
 		}
 
-		switch (frame.type) {
-			case "ping":
-				send(ws, { type: "pong" });
-				return;
+		try {
+			switch (frame.type) {
+				case "ping":
+					send(ws, { type: "pong" });
+					return;
 
-			case "subscribe":
-				await this.handleSubscribe(ws, frame.sessionId);
-				return;
+				case "subscribe":
+					await this.handleSubscribe(ws, frame.sessionId);
+					return;
 
-			case "unsubscribe":
-				this.handleUnsubscribe(ws, frame.sessionId);
-				return;
+				case "unsubscribe":
+					this.handleUnsubscribe(ws, frame.sessionId);
+					return;
 
-			case "subscribe_tasks":
-				ws.data.tasksSubscribed = true;
-				return;
+				case "subscribe_tasks":
+					ws.data.tasksSubscribed = true;
+					return;
 
-			case "unsubscribe_tasks":
-				ws.data.tasksSubscribed = false;
-				return;
+				case "unsubscribe_tasks":
+					ws.data.tasksSubscribed = false;
+					return;
 
-			case "prompt":
-				await this.handlePrompt(ws, frame);
-				return;
+				case "prompt":
+					await this.handlePrompt(ws, frame);
+					return;
 
-			case "abort":
-				await this.handleAbort(ws, frame.sessionId);
-				return;
+				case "abort":
+					await this.handleAbort(ws, frame.sessionId);
+					return;
 
-			case "clear_queue":
-				await this.handleClearQueue(ws, frame.sessionId);
-				return;
+				case "clear_queue":
+					await this.handleClearQueue(ws, frame.sessionId);
+					return;
 
-			case "cancel_queued":
-				await this.handleCancelQueued(ws, frame);
-				return;
+				case "cancel_queued":
+					await this.handleCancelQueued(ws, frame);
+					return;
 
-			case "edit_queued":
-				await this.handleEditQueued(ws, frame);
-				return;
+				case "edit_queued":
+					await this.handleEditQueued(ws, frame);
+					return;
 
-			case "ext_ui_dialog_response":
-				this.handleExtUiDialogResponse(ws, frame);
-				return;
+				case "ext_ui_dialog_response":
+					this.handleExtUiDialogResponse(ws, frame);
+					return;
 
-			case "set_plan_mode":
-				await this.handleSetPlanMode(ws, frame);
-				return;
+				case "set_plan_mode":
+					await this.handleSetPlanMode(ws, frame);
+					return;
 
-			case "plan_response":
-				await this.handlePlanResponse(ws, frame);
-				return;
-			case "plan_execution_action":
-				await this.handlePlanExecutionAction(ws, frame);
-				return;
-			case "goal_action":
-				await this.handleGoalAction(ws, frame);
-				return;
+				case "plan_response":
+					await this.handlePlanResponse(ws, frame);
+					return;
+				case "plan_execution_action":
+					await this.handlePlanExecutionAction(ws, frame);
+					return;
+				case "goal_action":
+					await this.handleGoalAction(ws, frame);
+					return;
 
-			default:
-				send(ws, { type: "error", error: `unknown frame type` });
+				default:
+					send(ws, { type: "error", error: `unknown frame type` });
+			}
+		} catch (err) {
+			log.warn(`message handling failed`, err);
+			try {
+				send(ws, { type: "error", error: "message handling failed" });
+			} catch (sendErr) {
+				log.warn(`message error send failed`, sendErr);
+			}
 		}
 	}
 
@@ -221,55 +235,86 @@ export class WsHub {
 			return;
 		}
 
-		// Streaming updates (`message_update` / `tool_execution_update`) fire
-		// per token / output chunk, each carrying the full accumulated payload
-		// — per-subscriber coalescing caps that at one flush per interval and
-		// is lossless because those events are latest-state snapshots. All
-		// other event types pass through immediately.
-		const coalescer = new StreamCoalescer((event) => {
-			try {
-				send(ws, { type: "session_event", sessionId, event });
-			} catch (err) {
-				// A timer-driven flush must never throw into Bun's event loop
-				// (fatal to the process) just because the socket is closing.
-				log.warn(`session event send failed`, err);
-			}
-		});
-		const unsubSession = handle.subscribe((event) => coalescer.push(event));
-		// Mirror extension-UI dialog frames (ask tool etc.) into this connection.
-		// `subscribeUiFrames` also replays any already-open dialogs so a page-
-		// reload subscriber sees the pending modal immediately.
-		const unsubUi = this.bridge.subscribeUiFrames(sessionId, (frame) => {
-			send(ws, frame);
-		});
-		// Mirror plan-mode lifecycle frames (mode-changed + proposed + resolved)
-		// into this connection. `subscribePlanModeFrames` replays the current
-		// plan-mode state + any pending approval card so a late tab re-renders
-		// the pill + approval UI immediately.
-		const unsubPlan = this.bridge.subscribePlanModeFrames(sessionId, (frame) => {
-			send(ws, frame);
-		});
+		let coalescer: StreamCoalescer | undefined;
+		let unsubSession: (() => void) | undefined;
+		let unsubUi: (() => void) | undefined;
+		let unsubPlan: (() => void) | undefined;
+		let released = false;
+		let subscriberTracked = false;
 		const teardown = (): void => {
-			coalescer.dispose();
+			if (released) return;
+			released = true;
+			coalescer?.dispose();
 			try {
-				unsubSession();
+				unsubSession?.();
 			} catch (err) {
 				log.warn(`session unsubscribe threw`, err);
 			}
 			try {
-				unsubUi();
+				unsubUi?.();
 			} catch (err) {
 				log.warn(`ui unsubscribe threw`, err);
 			}
 			try {
-				unsubPlan();
+				unsubPlan?.();
 			} catch (err) {
 				log.warn(`plan-mode unsubscribe threw`, err);
 			}
 		};
+
+		// Claim this session before installing listeners or awaiting a snapshot.
+		// A concurrent subscribe now observes the reservation and cannot replace
+		// this teardown, which would orphan the first set of listeners.
 		ws.data.subscriptions.set(sessionId, teardown);
-		this.bridge.trackSubscriberAdded(sessionId, connectionId);
-		send(ws, { type: "subscribed", sessionId, snapshot: await handle.snapshot() });
+
+		try {
+			this.bridge.trackSubscriberAdded(sessionId, connectionId);
+			subscriberTracked = true;
+			// Streaming updates (`message_update` / `tool_execution_update`) fire
+			// per token / output chunk, each carrying the full accumulated payload
+			// — per-subscriber coalescing caps that at one flush per interval and
+			// is lossless because those events are latest-state snapshots. All
+			// other event types pass through immediately.
+			coalescer = new StreamCoalescer((event) => {
+				try {
+					send(ws, { type: "session_event", sessionId, event });
+				} catch (err) {
+					// A timer-driven flush must never throw into Bun's event loop
+					// (fatal to the process) just because the socket is closing.
+					log.warn(`session event send failed`, err);
+				}
+			});
+			unsubSession = handle.subscribe((event) => coalescer?.push(event));
+			// Mirror extension-UI dialog frames (ask tool etc.) into this connection.
+			// `subscribeUiFrames` also replays any already-open dialogs so a page-
+			// reload subscriber sees the pending modal immediately.
+			unsubUi = this.bridge.subscribeUiFrames(sessionId, (frame) => {
+				try {
+					send(ws, frame);
+				} catch (err) {
+					log.warn(`ui frame send failed`, err);
+				}
+			});
+			// Mirror plan-mode lifecycle frames (mode-changed + proposed + resolved)
+			// into this connection. `subscribePlanModeFrames` replays the current
+			// plan-mode state + any pending approval card so a late tab re-renders
+			// the pill + approval UI immediately.
+			unsubPlan = this.bridge.subscribePlanModeFrames(sessionId, (frame) => {
+				try {
+					send(ws, frame);
+				} catch (err) {
+					log.warn(`plan-mode frame send failed`, err);
+				}
+			});
+			send(ws, { type: "subscribed", sessionId, snapshot: await handle.snapshot() });
+		} catch (err) {
+			teardown();
+			if (ws.data.subscriptions.get(sessionId) === teardown) {
+				ws.data.subscriptions.delete(sessionId);
+				if (subscriberTracked) this.bridge.trackSubscriberRemoved(sessionId, connectionId);
+			}
+			throw err;
+		}
 	}
 
 	private handleUnsubscribe(ws: ServerWebSocket<ConnectionData>, sessionId: string): void {

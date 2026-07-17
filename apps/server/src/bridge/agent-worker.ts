@@ -81,10 +81,12 @@ export async function runAgentWorker(): Promise<void> {
 		unsubscribeEvents = handle.subscribe((event) => {
 			send({ type: "event", channel: "session", event });
 		});
+		const extensionErrors = bridge.takeExtensionLoadErrors(handle.sessionId);
 		return {
 			sessionId: handle.sessionId,
 			sessionFile: handle.sessionFile,
 			cwd: handle.cwd,
+			...(extensionErrors.length > 0 ? { extensionErrors } : {}),
 		};
 	};
 
@@ -199,6 +201,8 @@ export async function runAgentWorker(): Promise<void> {
 				return requireHandle().compact(frame.args[0]);
 			case "session.setModel":
 				return requireHandle().setModel(frame.args[0]);
+			case "session.setThinkingLevel":
+				return requireHandle().setThinkingLevel(frame.args[0]);
 			case "session.dispatchSlashCommand":
 				return requireHandle().dispatchSlashCommand(frame.args[0]);
 			case "session.dispatchDeckSlashCommand":

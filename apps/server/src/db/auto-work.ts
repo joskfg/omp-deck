@@ -11,11 +11,17 @@
  * call `getAutoWorkConfig` too, never assume a row exists.
  */
 
-import type { AutoWorkConfig, AutoWorkModelByPriority, AutoWorkTimeWindow, ModelRef, TaskPriority } from "@omp-deck/protocol";
+import type { AutoWorkConfig, AutoWorkModelByDifficulty, AutoWorkModelByPriority, AutoWorkTimeWindow, ModelRef, TaskDifficulty, TaskPriority } from "@omp-deck/protocol";
 
 import { getDb, nowIso } from "./index.ts";
 
 const TASK_PRIORITIES: TaskPriority[] = ["P0", "P1", "P2", "P3", "P4", "P5"];
+const TASK_DIFFICULTIES: TaskDifficulty[] = ["easy", "medium", "hard"];
+
+/** Default per-difficulty agent mapping — all null (no override). */
+export const DEFAULT_MODEL_BY_DIFFICULTY: AutoWorkModelByDifficulty =
+	Object.fromEntries(TASK_DIFFICULTIES.map((d) => [d, null])) as AutoWorkModelByDifficulty;
+
 
 /** Default per-priority cost estimate (% of a session budget), used when no run history exists yet (T-63). */
 export const DEFAULT_ESTIMATE_PCT_BY_PRIORITY: Record<TaskPriority, number> = {
@@ -48,6 +54,7 @@ export const DEFAULT_AUTO_WORK_VALUES: Omit<AutoWorkConfig, "workspaceCwd" | "up
 	enabled: false,
 	autoMerge: false,
 	modelByPriority: Object.fromEntries(TASK_PRIORITIES.map((p) => [p, null])) as AutoWorkModelByPriority,
+	modelByDifficulty: DEFAULT_MODEL_BY_DIFFICULTY,
 	timeWindows: [{ start: 0, end: 24 }],
 	sessionPctLimit: 100,
 	weeklyPctLimit: 100,
@@ -70,6 +77,7 @@ interface Row {
 	estimation_buffer: number;
 	timeout_minutes_by_priority: string;
 	updated_at: string;
+	model_by_difficulty: string;
 }
 
 function parseTimeWindows(raw: string): AutoWorkTimeWindow[] {
@@ -103,6 +111,15 @@ function rowToConfig(r: Row): AutoWorkConfig {
 	} catch {
 		modelByPriority = DEFAULT_AUTO_WORK_VALUES.modelByPriority;
 	}
+	let modelByDifficulty: AutoWorkModelByDifficulty;
+	try {
+		const parsed = JSON.parse(r.model_by_difficulty) as Partial<Record<TaskDifficulty, ModelRef | null>>;
+		modelByDifficulty = Object.fromEntries(
+			TASK_DIFFICULTIES.map((d) => [d, parsed[d] ?? null]),
+		) as AutoWorkModelByDifficulty;
+	} catch {
+		modelByDifficulty = DEFAULT_MODEL_BY_DIFFICULTY;
+	}
 	let defaultEstimatePctByPriority: Record<TaskPriority, number>;
 	try {
 		const parsed = JSON.parse(r.default_estimate_pct_by_priority) as Partial<Record<TaskPriority, number>>;
@@ -126,6 +143,7 @@ function rowToConfig(r: Row): AutoWorkConfig {
 		enabled: r.enabled !== 0,
 		autoMerge: r.auto_merge !== 0,
 		modelByPriority,
+		modelByDifficulty,
 		timeWindows: parseTimeWindows(r.time_windows),
 		sessionPctLimit: r.session_pct_limit,
 		weeklyPctLimit: r.weekly_pct_limit,
@@ -141,7 +159,7 @@ function rowToConfig(r: Row): AutoWorkConfig {
 export function getAutoWorkConfig(cwd: string): AutoWorkConfig {
 	const row = getDb()
 		.query<Row, [string]>(
-			`SELECT workspace_cwd, enabled, auto_merge, model_by_priority, time_windows,
+			`SELECT workspace_cwd, enabled, auto_merge, model_by_priority, model_by_difficulty, time_windows,
 			        session_pct_limit, weekly_pct_limit, weekly_pct_threshold, default_estimate_pct_by_priority,
 			        estimation_buffer, timeout_minutes_by_priority, updated_at
 			 FROM auto_work_config WHERE workspace_cwd = ?`,
@@ -158,16 +176,17 @@ export function setAutoWorkConfig(
 ): AutoWorkConfig {
 	const db = getDb();
 	const now = nowIso();
-	db.prepare<unknown, [string, number, number, string, string, number, number, number, string, number, string, string]>(
+	db.prepare<unknown, [string, number, number, string, string, string, number, number, number, string, number, string, string]>(
 		`INSERT INTO auto_work_config
-		   (workspace_cwd, enabled, auto_merge, model_by_priority, time_windows,
+		   (workspace_cwd, enabled, auto_merge, model_by_priority, model_by_difficulty, time_windows,
 		    session_pct_limit, weekly_pct_limit, weekly_pct_threshold, default_estimate_pct_by_priority,
 		    estimation_buffer, timeout_minutes_by_priority, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(workspace_cwd) DO UPDATE SET
 		   enabled = excluded.enabled,
 		   auto_merge = excluded.auto_merge,
 		   model_by_priority = excluded.model_by_priority,
+		   model_by_difficulty = excluded.model_by_difficulty,
 		   time_windows = excluded.time_windows,
 		   session_pct_limit = excluded.session_pct_limit,
 		   weekly_pct_limit = excluded.weekly_pct_limit,
@@ -181,6 +200,7 @@ export function setAutoWorkConfig(
 		values.enabled ? 1 : 0,
 		values.autoMerge ? 1 : 0,
 		JSON.stringify(values.modelByPriority),
+		JSON.stringify(values.modelByDifficulty),
 		JSON.stringify(values.timeWindows),
 		values.sessionPctLimit,
 		values.weeklyPctLimit,
@@ -197,7 +217,7 @@ export function setAutoWorkConfig(
 export function listAutoWorkConfigs(): AutoWorkConfig[] {
 	const rows = getDb()
 		.query<Row, []>(
-			`SELECT workspace_cwd, enabled, auto_merge, model_by_priority, time_windows,
+			`SELECT workspace_cwd, enabled, auto_merge, model_by_priority, model_by_difficulty, time_windows,
 			        session_pct_limit, weekly_pct_limit, weekly_pct_threshold, default_estimate_pct_by_priority,
 			        estimation_buffer, timeout_minutes_by_priority, updated_at
 			 FROM auto_work_config`,

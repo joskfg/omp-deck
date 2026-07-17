@@ -10,8 +10,8 @@
  * - Top-level skip set matches orphan-census.py's conventions, PLUS the
  *   user-approved `projects/` exclusion. Mixed-signal projects/ tree stays
  *   out of v1.
- * - Symlinks/junctions (e.g. `cryptocracy/`) are followed once, by tracking
- *   visited absolute paths to break cycles.
+ * - Symlinks/junctions that resolve inside the KB root are followed once,
+ *   by tracking visited real paths to break cycles.
  * - Wikilink resolution is stem-first with subpath fallback; code blocks
  *   are stripped before extraction so regex-literal noise (`[[:alpha:]]`)
  *   doesn't leak into the link table.
@@ -153,7 +153,6 @@ interface GraphCache {
 }
 interface FileRecord {
 	relPath: string; // forward-slash kb-relative
-	absPath: string;
 	dir: string; // forward-slash relative dir, "" for root
 	stem: string; // lowercase filename stem (no .md)
 	size: number;
@@ -172,6 +171,8 @@ export class KbService {
 	private indexReady = false;
 	private indexPromise: Promise<void> | undefined;
 	private graphCache: GraphCache | undefined;
+	private rootRealPath: string | undefined;
+	private indexGeneration = 0;
 
 	constructor(opts: KbServiceOptions) {
 		// Always store the root as an absolute path with native separators.
@@ -180,20 +181,27 @@ export class KbService {
 
 	/** Lazy build on first request; subsequent calls reuse the cache. */
 	async ensureIndex(): Promise<void> {
-		if (this.indexReady) return;
-		if (this.indexPromise) return this.indexPromise;
-		this.indexPromise = this.buildIndex();
-		try {
-			await this.indexPromise;
-		} finally {
-			this.indexPromise = undefined;
+		while (!this.indexReady) {
+			if (!this.indexPromise) {
+				const build = this.buildIndex(this.indexGeneration);
+				this.indexPromise = build;
+				try {
+					await build;
+				} finally {
+					if (this.indexPromise === build) this.indexPromise = undefined;
+				}
+			} else {
+				await this.indexPromise;
+			}
 		}
 	}
 
 	/** Invalidate cache + rebuild on next request. Called by the watcher. */
 	invalidate(): void {
+		this.indexGeneration += 1;
 		this.indexReady = false;
 		this.graphCache = undefined;
+		this.rootRealPath = undefined;
 	}
 
 	/**
@@ -271,7 +279,7 @@ export class KbService {
 		// directory — keeps `/api/kb/tree?path=projects` 404 even though
 		// `projects` exists on disk.
 		if (this.pathIsExcluded(cleanRel)) return undefined;
-		const absDir = this.resolveAbs(cleanRel);
+		const absDir = await this.resolveExistingAbs(cleanRel);
 		if (!absDir) return undefined;
 		try {
 			const st = await stat(absDir);
@@ -293,7 +301,8 @@ export class KbService {
 		for (const entry of entries) {
 			if (this.shouldSkip(entry.name, joinRel(cleanRel, entry.name))) continue;
 			const relPath = joinRel(cleanRel, entry.name);
-			const abs = path.join(absDir, entry.name);
+			const abs = await this.resolveExistingAbs(relPath);
+			if (!abs) continue;
 
 			if (entry.isDirectory() || entry.isSymbolicLink()) {
 				let isDir = entry.isDirectory();
@@ -354,7 +363,7 @@ export class KbService {
 		const cleanRel = normalizeRel(subpath);
 		if (!cleanRel) return undefined;
 		if (this.pathIsExcluded(cleanRel)) return undefined;
-		const abs = this.resolveAbs(cleanRel);
+		const abs = await this.resolveExistingAbs(cleanRel);
 		if (!abs) return undefined;
 
 		let raw: string;
@@ -415,7 +424,7 @@ export class KbService {
 		const cleanRel = normalizeRel(subpath);
 		if (!cleanRel) return { kind: "invalid-path" };
 		if (this.pathIsExcluded(cleanRel)) return { kind: "invalid-path" };
-		const abs = this.resolveAbs(cleanRel);
+		const abs = await this.resolveWriteAbs(cleanRel);
 		if (!abs) return { kind: "invalid-path" };
 		if (!cleanRel.toLowerCase().endsWith(".md")) return { kind: "invalid-path" };
 
@@ -469,6 +478,43 @@ export class KbService {
 			return { kind: "invalid-path" };
 		}
 		return { kind: "ok", response };
+	}
+
+	/**
+	 * Create an empty directory at `subpath`. Mirrors `saveFile(..., "create")`'s
+	 * must-not-exist contract: fails with `{ kind: "conflict" }` if a file or
+	 * directory already sits at that path. Missing parent directories are
+	 * created on demand (same `resolveWriteAbs` symlink-safe walk used by
+	 * file creation).
+	 */
+	async createFolder(
+		subpath: string,
+	): Promise<{ kind: "ok"; entry: KbTreeEntry } | { kind: "conflict" } | { kind: "invalid-path" }> {
+		await this.ensureIndex();
+		const cleanRel = normalizeRel(subpath);
+		if (!cleanRel) return { kind: "invalid-path" };
+		if (this.pathIsExcluded(cleanRel)) return { kind: "invalid-path" };
+		const abs = await this.resolveWriteAbs(cleanRel);
+		if (!abs) return { kind: "invalid-path" };
+		if (existsSync(abs)) return { kind: "conflict" };
+
+		try {
+			await mkdir(abs, { recursive: true });
+		} catch (err) {
+			log.error(`mkdir failed at ${abs}`, err);
+			return { kind: "invalid-path" };
+		}
+
+		this.invalidate();
+		return {
+			kind: "ok",
+			entry: {
+				name: path.posix.basename(cleanRel),
+				path: cleanRel,
+				kind: "dir",
+				mdCount: 0,
+			},
+		};
 	}
 
 	/**
@@ -565,9 +611,11 @@ export class KbService {
 		// here doesn't help much: the index is already in OS page cache from
 		// the graph build).
 		for (const r of this.records) {
+			const abs = await this.resolveExistingAbs(r.relPath);
+			if (!abs) continue;
 			let raw: string;
 			try {
-				raw = await readFile(r.absPath, "utf8");
+				raw = await readFile(abs, "utf8");
 			} catch {
 				continue;
 			}
@@ -646,12 +694,14 @@ export class KbService {
 		for (let i = 0; i < this.records.length; i += CHUNK) {
 			const chunk = this.records.slice(i, i + CHUNK);
 			const reads = await Promise.all(
-				chunk.map((r) =>
-					readFile(r.absPath, "utf8").then(
+				chunk.map(async (r) => {
+					const abs = await this.resolveExistingAbs(r.relPath);
+					if (!abs) return { r, raw: undefined as string | undefined };
+					return readFile(abs, "utf8").then(
 						(raw) => ({ r, raw }),
 						() => ({ r, raw: undefined as string | undefined }),
-					),
-				),
+					);
+				}),
 			);
 			for (const { r, raw } of reads) {
 				if (raw === undefined) continue;
@@ -702,40 +752,71 @@ export class KbService {
 	}
 	// ─── internals ───────────────────────────────────────────────────────
 
-	private async buildIndex(): Promise<void> {
+	private async buildIndex(generation: number): Promise<void> {
 		const t0 = performance.now();
-		this.records = [];
-		this.byRelPath.clear();
-		this.byStem.clear();
+		const records: FileRecord[] = [];
+		const byRelPath = new Map<string, FileRecord>();
+		const byStem = new Map<string, FileRecord[]>();
 
 		if (!existsSync(this.root)) {
 			log.warn(`kb root does not exist: ${this.root}`);
-			this.indexReady = true;
+			if (generation === this.indexGeneration) {
+				this.records = records;
+				this.byRelPath = byRelPath;
+				this.byStem = byStem;
+				this.rootRealPath = undefined;
+				this.indexReady = true;
+			}
 			return;
 		}
 
+		let rootRealPath: string;
+		try {
+			rootRealPath = await realpath(this.root);
+		} catch {
+			if (generation === this.indexGeneration) {
+				this.records = records;
+				this.byRelPath = byRelPath;
+				this.byStem = byStem;
+				this.rootRealPath = undefined;
+				this.indexReady = true;
+			}
+			return;
+		}
 		const visited = new Set<string>();
-		await this.walk(this.root, "", visited);
+		await this.walk(this.root, "", visited, rootRealPath, records);
 
-		for (const r of this.records) {
-			this.byRelPath.set(r.relPath, r);
-			const list = this.byStem.get(r.stem);
+		for (const r of records) {
+			byRelPath.set(r.relPath, r);
+			const list = byStem.get(r.stem);
 			if (list) list.push(r);
-			else this.byStem.set(r.stem, [r]);
+			else byStem.set(r.stem, [r]);
 		}
 
+		if (generation !== this.indexGeneration) return;
+		this.records = records;
+		this.byRelPath = byRelPath;
+		this.byStem = byStem;
+		this.rootRealPath = rootRealPath;
 		const ms = (performance.now() - t0).toFixed(1);
-		log.info(`indexed ${this.records.length} md files under ${this.root} in ${ms}ms`);
+		log.info(`indexed ${records.length} md files under ${this.root} in ${ms}ms`);
 		this.indexReady = true;
 	}
 
-	private async walk(absDir: string, relDir: string, visited: Set<string>): Promise<void> {
+	private async walk(
+		absDir: string,
+		relDir: string,
+		visited: Set<string>,
+		rootRealPath: string,
+		records: FileRecord[],
+	): Promise<void> {
 		let real;
 		try {
 			real = await realpath(absDir);
 		} catch {
 			return;
 		}
+		if (!isWithinRoot(rootRealPath, real)) return;
 		if (visited.has(real)) return;
 		visited.add(real);
 
@@ -756,10 +837,10 @@ export class KbService {
 				try {
 					const st = await stat(abs);
 					if (st.isDirectory()) {
-						await this.walk(abs, rel, visited);
+						await this.walk(abs, rel, visited, rootRealPath, records);
 					}
 				} catch {
-					// stat failure on symlink target; skip silently
+					// stat failure on symlink target, skip silently
 				}
 				continue;
 			}
@@ -770,9 +851,8 @@ export class KbService {
 			try {
 				const st = await stat(abs);
 				const stem = entry.name.slice(0, -3).toLowerCase();
-				this.records.push({
+				records.push({
 					relPath: rel,
-					absPath: abs,
 					dir: relDir,
 					stem,
 					size: st.size,
@@ -803,14 +883,47 @@ export class KbService {
 		return false;
 	}
 
-	private resolveAbs(rel: string): string | undefined {
+	private resolveLexicalAbs(rel: string): string | undefined {
 		// Reject any rel that escapes the root via `..` or absolute paths.
 		if (rel.includes("..") || path.isAbsolute(rel)) return undefined;
 		const abs = rel ? path.join(this.root, rel) : this.root;
 		const resolved = path.resolve(abs);
 		const rootResolved = path.resolve(this.root);
-		if (!resolved.startsWith(rootResolved)) return undefined;
+		if (!isWithinRoot(rootResolved, resolved)) return undefined;
 		return resolved;
+	}
+
+	private async resolveExistingAbs(rel: string): Promise<string | undefined> {
+		const abs = this.resolveLexicalAbs(rel);
+		if (!abs) return undefined;
+		const [rootRealPath, targetRealPath] = await Promise.all([
+			this.getRootRealPath(),
+			realpath(abs).catch(() => undefined),
+		]);
+		if (!rootRealPath || !targetRealPath || !isWithinRoot(rootRealPath, targetRealPath)) return undefined;
+		return abs;
+	}
+
+	private async resolveWriteAbs(rel: string): Promise<string | undefined> {
+		const abs = this.resolveLexicalAbs(rel);
+		if (!abs) return undefined;
+		const rootRealPath = await this.getRootRealPath();
+		if (!rootRealPath) return undefined;
+		let parent = path.dirname(abs);
+		while (true) {
+			try {
+				const parentRealPath = await realpath(parent);
+				return isWithinRoot(rootRealPath, parentRealPath) ? abs : undefined;
+			} catch {
+				const next = path.dirname(parent);
+				if (next === parent) return undefined;
+				parent = next;
+			}
+		}
+	}
+
+	private async getRootRealPath(): Promise<string | undefined> {
+		return this.rootRealPath ?? realpath(this.root).catch(() => undefined);
 	}
 
 	private recursiveMdCount(relDir: string): number {
@@ -962,6 +1075,11 @@ function normalizeRel(p: string): string {
 	if (!p) return "";
 	// Strip leading/trailing slashes, collapse repeated slashes, force forward.
 	return p.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+}
+
+function isWithinRoot(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
 function joinRel(parent: string, child: string): string {

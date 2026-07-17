@@ -29,6 +29,10 @@ export interface WorkerSessionMetadata {
 	sessionId: string;
 	sessionFile: string | undefined;
 	cwd: string;
+	/** Extension load failures from this session's `createAgentSession` call
+	 *  (T-35), for the parent process to persist to the governance audit
+	 *  trail. Empty/absent when every discovered extension loaded cleanly. */
+	extensionErrors?: Array<{ path: string; error: string }>;
 }
 
 
@@ -85,6 +89,7 @@ export interface WorkerMethodMap {
 	"session.setName": WorkerRequestSpec<[name: string], void>;
 	"session.compact": WorkerRequestSpec<[focus?: string], void>;
 	"session.setModel": WorkerRequestSpec<[ref: ModelRef], void>;
+	"session.setThinkingLevel": WorkerRequestSpec<[level: string], void>;
 	"session.dispatchSlashCommand": WorkerRequestSpec<[text: string], SlashDispatchResult>;
 	"session.dispatchDeckSlashCommand": WorkerRequestSpec<[text: string], SlashDispatchResult>;
 	"session.getContextUsage": WorkerRequestSpec<[], ContextUsage | undefined>;

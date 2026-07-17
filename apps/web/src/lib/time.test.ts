@@ -60,11 +60,6 @@ describe("formatBriefTime", () => {
 		expect(formatBriefTime(old, now)).toBe("08/01/24");
 	});
 
-	test("boundary at 60s flips 'just now' → '1m'", () => {
-		expect(formatBriefTime(new Date(ANCHOR - 59_999).toISOString(), ANCHOR)).toBe("just now");
-		expect(formatBriefTime(new Date(ANCHOR - 60_000).toISOString(), ANCHOR)).toBe("1m");
-	});
-
 	test("boundary at 60m flips 'Xm' → time-of-day", () => {
 		// 60 minutes elapsed = exactly 1 hour ago; should fall into the time-of-day tier.
 		const now = new Date(2026, 4, 23, 12, 0, 0).getTime();

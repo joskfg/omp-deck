@@ -18,8 +18,7 @@ export class WsClient {
 	private closed = false;
 
 	constructor(url?: string) {
-		const proto = location.protocol === "https:" ? "wss" : "ws";
-		this.url = url ?? `${proto}://${location.host}/ws`;
+		this.url = url ?? `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
 	}
 
 	connect(): void {
@@ -73,7 +72,7 @@ export class WsClient {
 	send(frame: ClientFrame): void {
 		if (this.socket && this.socket.readyState === WebSocket.OPEN) {
 			this.socket.send(JSON.stringify(frame));
-		} else {
+		} else if (frame.type !== "subscribe" && frame.type !== "subscribe_tasks") {
 			this.queue.push(frame);
 		}
 	}

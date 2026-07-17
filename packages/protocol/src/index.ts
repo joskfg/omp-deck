@@ -35,6 +35,12 @@ export interface SessionSummary {
 	messageCount: number;
 	/** Elapsed ms between createdAt and updatedAt — a proxy for session duration. */
 	durationMs?: number;
+	/**
+	/**
+	 * Path to the session this one was forked or handed off from, when the
+	 * SDK recorded one (T-31). Absent for root sessions.
+	 */
+	parentPath?: string;
 }
 
 export type SessionMonitorStatus = "active" | "error" | "completed";
@@ -99,6 +105,10 @@ export interface ListWorkspacesResponse {
 	defaultCwd: string;
 }
 
+export interface AddWorkspaceRequest {
+	cwd: string;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Workspace preferences (per-cwd model default, T-42)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -121,6 +131,58 @@ export interface SetWorkspacePreferenceRequest {
 
 export interface ListWorkspacePreferencesResponse {
 	preferences: WorkspacePreference[];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Codebase Memory MCP (per-cwd project override, T-111)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface CodebaseMemoryMcpStatus {
+	cwd: string;
+	/** Effective state. Defaults to true when the project has no override. */
+	enabled: boolean;
+	/** Whether this project has an explicit `.omp/mcp.json` override. */
+	configured: boolean;
+}
+
+export interface SetCodebaseMemoryMcpRequest {
+	enabled: boolean;
+}
+
+export interface CodebaseMemoryTool {
+	name: string;
+	description?: string;
+	inputSchema: Record<string, unknown>;
+}
+
+export interface CodebaseMemoryContentBlock {
+	type: "text" | "resource";
+	text?: string;
+	uri?: string;
+	mimeType?: string;
+}
+
+export interface CodebaseMemoryOverview {
+	cwd: string;
+	state: "ready" | "disabled" | "unavailable";
+	message?: string;
+	tools: CodebaseMemoryTool[];
+	catalog: CodebaseMemoryContentBlock[];
+}
+
+export interface QueryCodebaseMemoryRequest {
+	tool: string;
+	arguments: Record<string, unknown>;
+}
+
+export interface CodebaseMemoryQueryResult {
+	content: CodebaseMemoryContentBlock[];
+	isError: boolean;
+}
+
+export interface CodebaseMemoryIndexResult {
+	content: CodebaseMemoryContentBlock[];
+	isError: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -759,6 +821,15 @@ export interface SubscriptionUsageLimit {
 	resetAt: string;
 	/** Window duration in milliseconds, when the provider reports it. */
 	windowDurationMs?: number;
+	/** Provider identifier (e.g. "anthropic", "openai"). */
+	provider?: string;
+	/**
+	 * Account, org or project label scoping this limit — derived server-side as
+	 * `scope.accountId ?? orgId ?? projectId ?? tier ?? "(shared)"`, so it is
+	 * always a non-empty string when the field is present. Absent only on very
+	 * old cached responses from pre-T128 servers.
+	 */
+	account?: string;
 }
 
 /**
@@ -794,6 +865,8 @@ export interface SessionUsageSummary {
 	id: string;
 	path: string;
 	cwd: string;
+	/** Human-readable label for the workspace (account), derived from cwd the same way as WorkspaceEntry.label. */
+	accountLabel: string;
 	title?: string;
 	updatedAt: string;
 	/** Sum of `usage.totalTokens` across every assistant message in the transcript. */
@@ -801,6 +874,12 @@ export interface SessionUsageSummary {
 	/** Sum of `usage.cost.total` (USD) across every assistant message, when the transcript recorded cost. */
 	costUsd: number;
 	messageCount: number;
+	/**
+	 * AI provider for this session, derived from the first `model_change` entry in the transcript
+	 * (format `"provider/modelId"`) or from the `provider` field on the first assistant message.
+	 * Absent when the transcript records no model information.
+	 */
+	provider?: string;
 }
 
 export interface ListSessionUsageResponse {
@@ -843,6 +922,106 @@ export interface SpendSummaryResponse {
 	monthStart: string;
 	/** One entry per known workspace, sorted by month spend desc. */
 	accounts: AccountSpendEntry[];
+}
+
+// ---------------------------------------------------------------------------
+// T-37: Aggregated historical OMP stats (via @oh-my-pi/omp-stats)
+// ---------------------------------------------------------------------------
+
+/**
+ * Valid range strings accepted by `GET /api/usage/stats?range=`.
+ * Mirrors omp-stats' internal TimeRange.
+ */
+export type OmpStatsRange = "1h" | "24h" | "7d" | "30d" | "90d" | "all";
+
+/**
+ * A resolved Deck session link, returned inside `HistoricalModelStats.sessionLinks`.
+ * All resolution happens server-side; no raw filesystem paths are sent to the client.
+ */
+export interface SessionDrillDownLink {
+	/** Deck session ID — can be used to navigate to `/c/:sessionId`. */
+	sessionId: string;
+	/** Session title, if one has been generated. */
+	title?: string;
+	/** Workspace cwd that owns this session. */
+	cwd: string;
+	/**
+	 * Agent role that generated the stats rows linking to this session.
+	 * `main` = top-level agent session; `subagent` = task subagent;
+	 * `advisor` = advisor transcript nested inside a session.
+	 */
+	agentType: "main" | "subagent" | "advisor";
+}
+
+/** Per-model aggregate within an `AggregatedStatsResponse`. */
+export interface HistoricalModelStats {
+	model: string;
+	provider: string;
+	costUsd: number;
+	totalTokens: number;
+	requests: number;
+	/** Up to 20 resolved Deck session links for drill-down. */
+	sessionLinks: SessionDrillDownLink[];
+}
+
+/** Per-workspace aggregate within an `AggregatedStatsResponse`. */
+export interface HistoricalWorkspaceStats {
+	/** Workspace path (maps to omp-stats `messages.folder`). */
+	cwd: string;
+	/** Human-readable label derived the same way as `WorkspaceEntry.label`. */
+	label: string;
+	costUsd: number;
+	totalTokens: number;
+	requests: number;
+}
+
+/**
+ * Per-agent-type aggregate within an `AggregatedStatsResponse`.
+ * Satisfies the acceptance criterion "session and routine data are not mixed
+ * without explicit labeling": this breakdown shows the distribution across
+ * main agent sessions, subagents, and advisors within the session dataset.
+ * Deck `routine_runs` are a separate data source and are NOT included here.
+ */
+export interface HistoricalAgentTypeStats {
+	/** Agent role: main session, task subagent, or advisor transcript. */
+	agentType: "main" | "subagent" | "advisor";
+	costUsd: number;
+	totalTokens: number;
+	requests: number;
+}
+
+/**
+ * `GET /api/usage/stats` — aggregated historical OMP usage stats backed by
+ * the @oh-my-pi/omp-stats SQLite DB.
+ *
+ * `source: "sessions"` is explicit: only agent-session transcript data is
+ * included.  Deck routine_runs are a separate data source; if they are ever
+ * added they will appear under a separate `sourceType: "routine"` breakdown
+ * to avoid mixing without labeling.
+ *
+ * Filters (all optional, combinable):
+ *   - `range`     — time window (1h | 24h | 7d | 30d | 90d | all)
+ *   - `cwd`       — restrict to one workspace
+ *   - `model`     — restrict to one model
+ *   - `agentType` — restrict to one agent role
+ */
+export interface AggregatedStatsResponse {
+	range: OmpStatsRange;
+	/**
+	 * Explicit data-source label. Always "sessions" today.
+	 * A future `sourceType: "routine"` entry would carry routine costs.
+	 */
+	source: "sessions";
+	/** True while a background omp-stats sync is in progress. */
+	syncInProgress: boolean;
+	total: {
+		costUsd: number;
+		totalTokens: number;
+		requests: number;
+	};
+	byModel: HistoricalModelStats[];
+	byWorkspace: HistoricalWorkspaceStats[];
+	byAgentType: HistoricalAgentTypeStats[];
 }
 
 /**
@@ -919,6 +1098,8 @@ export interface SessionSnapshot {
 	sessionId: string;
 	sessionFile?: string;
 	sessionName?: string;
+	/** Set when this session itself is a fork/handoff of another session (T-31). */
+	parentSessionPath?: string;
 	cwd: string;
 	model?: ModelRef;
 	thinkingLevel?: string;
@@ -978,6 +1159,27 @@ export interface SessionSnapshot {
 }
 
 /**
+ * Forward pointer to the session an automatic context handoff continued
+ * into (T-32). Never reflects a manual fork — see
+ * `GET /sessions/handoff-successor` and `bridge/session-handoff.ts`.
+ */
+export interface SessionHandoffSuccessor {
+	sessionId: string;
+	sessionFile: string;
+	createdAt: string;
+}
+
+export interface GetSessionHandoffSuccessorQuery {
+	cwd: string;
+	sessionFile: string;
+}
+
+/** `successor: null` means no automatic-handoff continuation was found. */
+export interface GetSessionHandoffSuccessorResponse {
+	successor: SessionHandoffSuccessor | null;
+}
+
+/**
  * Aggregated token/cost usage across a set of assistant messages. Mirrors
  * the web client's local rollup shape so a snapshot can seed it directly.
  */
@@ -999,6 +1201,239 @@ export interface UsageRollupWire {
 export interface SessionHistoryResponse {
 	messages: AgentMessageJson[];
 	startIndex: number;
+}
+
+/**
+ * Coarse classification of a session-tree entry for timeline rendering
+ * (T-31). `user_message` / `assistant_message` / `tool_message` cover the
+ * common `message` entries by role, `message` is the fallback for any other
+ * role (e.g. system). The rest mirror the SDK's non-message entry types.
+ */
+export type SessionTreeEntryKind =
+	| "user_message"
+	| "assistant_message"
+	| "tool_message"
+	| "message"
+	| "thinking_level_change"
+	| "model_change"
+	| "service_tier_change"
+	| "compaction"
+	| "branch_summary"
+	| "custom"
+	| "custom_message"
+	| "label"
+	| "title_change"
+	| "ttsr_injection"
+	| "mcp_tool_selection"
+	| "session_init"
+	| "mode_change";
+
+/** Compact, wire-safe summary of one session-tree entry. Never carries full
+ *  message content — `preview` is truncated server-side. */
+export interface SessionTreeEntryWire {
+	id: string;
+	parentId: string | null;
+	kind: SessionTreeEntryKind;
+	timestamp: string;
+	preview: string;
+	/** User-defined bookmark label on this entry, when set. */
+	label?: string;
+	/** Rule names injected by this entry, present only for `kind: "ttsr_injection"` (T-35). */
+	injectedRules?: string[];
+}
+
+export interface SessionTreeNodeWire {
+	entry: SessionTreeEntryWire;
+	children: SessionTreeNodeWire[];
+}
+
+/**
+ * Response of `GET /sessions/:id/tree` — the full append-only entry tree for
+ * one session, live or persisted. `roots` normally holds a single root,
+ * orphaned entries (broken parent chain) surface as extra roots.
+ */
+export interface SessionTreeResponse {
+	sessionId: string;
+	sessionFile: string;
+	cwd: string;
+	/** Set when this session itself is a fork/handoff of another session. */
+	parentSessionPath?: string;
+	/** Currently active leaf entry id — the tip of the live branch — or null for an empty session. */
+	leafId: string | null;
+	roots: SessionTreeNodeWire[];
+}
+
+/** Body of `POST /sessions/:id/branch`. */
+export interface BranchSessionRequest {
+	/** Entry id (from `SessionTreeResponse`) to branch from. */
+	entryId: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Governance: rules, TTSR, hooks/extensions (T-35)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Which bucket a rule falls into once loaded — mirrors the SDK's
+ *  `bucketRules` precedence (TTSR > always-apply > rulebook > inactive).
+ *  `inactive` means the rule loaded but has neither a TTSR condition, an
+ *  `alwaysApply` flag, nor a `description` — the SDK silently drops it. */
+export type RuleBucket = "ttsr" | "always-apply" | "rulebook" | "inactive";
+
+export type RuleInterruptMode = "never" | "prose-only" | "tool-only" | "always";
+
+export type RuleDisabledReason = "rule-disabled" | "provider-disabled" | "shadowed";
+
+export interface GovernanceSource {
+	provider: string;
+	providerName: string;
+	level: "user" | "project" | "native";
+}
+
+export interface RuleInfo {
+	name: string;
+	path: string;
+	description?: string;
+	scope?: string[];
+	condition?: string[];
+	astCondition?: string[];
+	alwaysApply?: boolean;
+	/** Effective interrupt mode: the rule's own override, or the global `ttsr.interruptMode`. */
+	interruptMode: RuleInterruptMode;
+	/** True when this rule declares its own `interruptMode` (vs. inheriting the global default). */
+	interruptModeOverridden: boolean;
+	bucket: RuleBucket;
+	source: GovernanceSource;
+	enabled: boolean;
+	disabledReason?: RuleDisabledReason;
+	shadowedBy?: string;
+}
+
+export interface TtsrGlobalSettings {
+	enabled: boolean;
+	interruptMode: RuleInterruptMode;
+	builtinRules: boolean;
+	contextMode: "discard" | "keep";
+	repeatMode: "once" | "after-gap";
+	repeatGap: number;
+}
+
+export interface ListRulesResponse {
+	rules: RuleInfo[];
+	ttsr: TtsrGlobalSettings;
+	warnings: string[];
+}
+
+export interface SetRuleEnabledRequest {
+	enabled: boolean;
+}
+
+export interface SetRuleEnabledResponse {
+	rule: RuleInfo;
+	audit: GovernanceAuditEntry;
+}
+
+/** Governed extension kinds — the SDK's Extension Control Center covers more
+ *  (skills, mcp, context-files, ...); T-35 scopes governance to the two
+ *  kinds the task explicitly names: extension modules and pre/post hooks. */
+export type GovernedExtensionKind = "extension-module" | "hook";
+
+export type ExtensionState = "active" | "disabled" | "shadowed";
+
+export type ExtensionDisabledReason = "item-disabled" | "provider-disabled" | "shadowed";
+
+export interface ExtensionInfo {
+	/** Canonical `${kind}:${name}` id — same scheme the SDK's own Extension
+	 *  Control Center uses for `disabledExtensions` entries. */
+	id: string;
+	kind: GovernedExtensionKind;
+	name: string;
+	path: string;
+	source: GovernanceSource;
+	state: ExtensionState;
+	disabledReason?: ExtensionDisabledReason;
+	shadowedBy?: string;
+	/** Hook-only: `pre`/`post` + the tool it applies to (e.g. `pre:edit`). */
+	trigger?: string;
+}
+
+export interface ExtensionLoadErrorInfo {
+	id: string;
+	occurredAt: string;
+	sessionId?: string;
+	cwd?: string;
+	path: string;
+	message: string;
+}
+
+export interface ListExtensionsResponse {
+	extensions: ExtensionInfo[];
+	loadErrors: ExtensionLoadErrorInfo[];
+	warnings: string[];
+}
+
+export interface SetExtensionEnabledRequest {
+	enabled: boolean;
+}
+
+export interface SetExtensionEnabledResponse {
+	extension: ExtensionInfo;
+	audit: GovernanceAuditEntry;
+}
+
+/** Best-effort explanation for one rule named by a persisted TTSR injection
+ *  entry — looked up against the *current* rule inventory, so `found: false`
+ *  is possible when the rule file has since been edited away or renamed. */
+export interface TtsrRuleExplain {
+	name: string;
+	found: boolean;
+	description?: string;
+	condition?: string[];
+	astCondition?: string[];
+	scope?: string[];
+	interruptMode?: RuleInterruptMode;
+}
+
+export interface TtsrHistoryEntry {
+	sessionId: string;
+	sessionPath: string;
+	cwd: string;
+	sessionTitle?: string;
+	entryId: string;
+	occurredAt: string;
+	ruleNames: string[];
+	rules: TtsrRuleExplain[];
+}
+
+export interface ListTtsrHistoryResponse {
+	entries: TtsrHistoryEntry[];
+	/** True when the session scan hit `limit` and older sessions weren't checked. */
+	truncated: boolean;
+}
+
+export type GovernanceAuditKind = "rule" | "extension" | "extension_load_error";
+export type GovernanceAuditAction = "enable" | "disable" | "load_error";
+export type GovernanceAuditResult = "ok" | "error";
+
+/** One row of the governance audit trail (T-35). Config changes (rule/extension
+ *  enable-disable) and extension runtime load errors both land here so the UI
+ *  has one place to explain "what changed and why". */
+export interface GovernanceAuditEntry {
+	id: string;
+	occurredAt: string;
+	kind: GovernanceAuditKind;
+	targetId: string;
+	action: GovernanceAuditAction;
+	actor: string;
+	cwd?: string;
+	sessionId?: string;
+	before?: unknown;
+	after?: unknown;
+	result: GovernanceAuditResult;
+	error?: string;
+}
+
+export interface ListGovernanceAuditResponse {
+	entries: GovernanceAuditEntry[];
 }
 
 /**
@@ -1390,6 +1825,9 @@ export type KnownTool = (typeof KNOWN_TOOLS)[number];
 /** P0 is highest priority, P5 lowest. Cards without an explicit priority are
  * treated as P5 (see migration 005). */
 export type TaskPriority = "P0" | "P1" | "P2" | "P3" | "P4" | "P5";
+/** Effort level of a task, used to select the auto-work execution agent (T-109). */
+export type TaskDifficulty = "easy" | "medium" | "hard";
+
 
 export interface TaskState {
 	id: string;
@@ -1408,6 +1846,11 @@ export interface Task {
 	stateId: string;
 	orderInState: number;
 	priority: TaskPriority;
+	/**
+	 * Effort level of this task (T-109). Always present — defaults to `"medium"`
+	 * on create when omitted. Drives auto-work agent selection via `modelByDifficulty`.
+	 */
+	difficulty: TaskDifficulty;
 	cwd?: string;
 	createdAt: string;
 	updatedAt: string;
@@ -1445,6 +1888,8 @@ export interface CreateTaskRequest {
 	dependsOn?: string[];
 	/** Defaults to `false` server-side when omitted (T-58). */
 	autoWork?: boolean;
+	/** Defaults to `"medium"` server-side when omitted (T-109). */
+	difficulty?: TaskDifficulty;
 }
 
 export interface UpdateTaskRequest {
@@ -1458,6 +1903,8 @@ export interface UpdateTaskRequest {
 	/** Replaces the full dependency set when present (T-57). */
 	dependsOn?: string[];
 	autoWork?: boolean;
+	/** When present, replaces the task's difficulty (T-109). */
+	difficulty?: TaskDifficulty;
 }
 
 export interface ListTasksResponse {
@@ -2035,6 +2482,12 @@ export interface OAuthPromptReplyRequest {
  * means "use the workspace default model" (see `WorkspacePreference`).
  */
 export type AutoWorkModelByPriority = Record<TaskPriority, ModelRef | null>;
+/**
+ * Per-difficulty model override for auto-work runs (T-109). `null` means
+ * "no override for this difficulty level — fall through the cascade".
+ */
+export type AutoWorkModelByDifficulty = Record<TaskDifficulty, ModelRef | null>;
+
 
 /** One auto-work execution window — a half-open hour range [start, end). */
 export interface AutoWorkTimeWindow {
@@ -2065,6 +2518,15 @@ export interface AutoWorkConfig {
 	 */
 	autoMerge: boolean;
 	modelByPriority: AutoWorkModelByPriority;
+	/**
+	 * Per-difficulty model override for auto-work agent selection (T-109).
+	 * Within each config tier (workspace, then global), tries the task's own
+	 * difficulty first, then cascades to lower difficulties only (hard→medium→easy).
+	 * Full cascade: workspace[difficulty]…→ global[difficulty]…→ workspace default model.
+	 * Replaces `modelByPriority` as the primary agent selector; `modelByPriority`
+	 * is retained for backward compatibility but no longer consulted during selection.
+	 */
+	modelByDifficulty: AutoWorkModelByDifficulty;
 	/**
 	 * Non-overlapping time windows (hour-of-day) during which auto-work may
 	 * run. Empty array = never run. Sorted by `start` for display.
@@ -2105,6 +2567,7 @@ export interface SetAutoWorkConfigRequest {
 	enabled: boolean;
 	autoMerge: boolean;
 	modelByPriority: AutoWorkModelByPriority;
+	modelByDifficulty: AutoWorkModelByDifficulty;
 	timeWindows: AutoWorkTimeWindow[];
 	sessionPctLimit: number;
 	weeklyPctLimit: number;
@@ -2140,6 +2603,12 @@ export interface AutoWorkGlobalConfig {
 	 * is the only cadence.
 	 */
 	squeezeEnabled: boolean;
+	/**
+	 * Global fallback difficulty→agent mapping (T-109). Consulted when the
+	 * per-workspace `modelByDifficulty` has no entry for the task's difficulty
+	 * level (after cascading hard→medium→easy within the workspace).
+	 */
+	modelByDifficulty: AutoWorkModelByDifficulty;
 	updatedAt: string;
 }
 
@@ -2149,6 +2618,7 @@ export interface SetAutoWorkGlobalConfigRequest {
 	scheduleIntervalMinutes: number;
 	taskSelectionModel: ModelRef | null;
 	squeezeEnabled: boolean;
+	modelByDifficulty: AutoWorkModelByDifficulty;
 }
 
 /** `GET /api/auto-work/schedule-status` response (global, not per-workspace). */
@@ -2342,7 +2812,7 @@ export interface AutoWorkCostEstimateResponse {
  */
 export type AutoWorkCycleResult =
 	| { outcome: "skipped"; reason: string }
-	| { outcome: "completed"; taskId: string; runId: string; sessionId: string; worktreePath: string }
+	| { outcome: "completed"; taskId: string; runId: string; sessionId: string; worktreePath: string; prNumber?: number; prStatus: "opened" | "already_open" | "failed"; prFailureReason?: string }
 	| { outcome: "failed"; taskId: string; runId: string; sessionId: string; worktreePath: string; failureReason: string }
 	| { outcome: "timed_out"; taskId: string; runId: string; sessionId: string; worktreePath: string };
 
@@ -2451,4 +2921,275 @@ export interface DiscardDelegationArtifactRequest {
 export interface DiscardDelegationArtifactResponse {
 	ok: boolean;
 	message: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Policy governance — model roles, retry/fallback, auto-compaction (T-36)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The OMP agent settings the deck governs for model-role assignment, retry
+ * and fallback behavior, and auto-compaction. Same pattern as delegation
+ * governance (T-28, `routes-delegation.ts`) and memory governance (T-34): the
+ * single source of truth is OMP's own settings store
+ * (`~/.omp/agent/config.yml`, surfaced through the SDK `Settings` singleton)
+ * — the deck never persists a copy of these values. Reads are call-time inside
+ * the SDK, so a change here applies to the next request even in live sessions.
+ */
+export type PolicySettingKey =
+	| "modelRoles"
+	| "defaultThinkingLevel"
+	| "retry.enabled"
+	| "retry.maxRetries"
+	| "retry.baseDelayMs"
+	| "retry.maxDelayMs"
+	| "retry.modelFallback"
+	| "retry.fallbackChains"
+	| "retry.fallbackRevertPolicy"
+	| "compaction.enabled"
+	| "compaction.midTurnEnabled"
+	| "compaction.strategy"
+	| "compaction.thresholdPercent"
+	| "compaction.thresholdTokens"
+	| "compaction.handoffSaveToDisk"
+	| "compaction.autoContinue";
+
+/** One selectable value for an enum-typed policy setting. */
+export interface PolicySettingOption {
+	value: string;
+	label: string;
+	description?: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Memory governance (T-34)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The OMP agent's own session-memory subsystem (Hindsight remote / Mnemopi
+ * local SQLite / local rollout summaries) — distinct from the deck's KB
+ * (`kb-service.ts`), which is hand-tended long-term knowledge. Governed the
+ * same way as delegation settings (T-28): the single source of truth is
+ * OMP's own settings store, the deck never persists a copy. Deliberately a
+ * narrow, curated key list — never every `memory.*`/`mnemopi.*`/`hindsight.*`
+ * schema entry — so credential-shaped fields (`hindsight.apiToken`,
+ * `mnemopi.llmApiKey`, `mnemopi.embeddingApiKey`) can never be read or
+ * written through this surface.
+ */
+export type MemorySettingKey =
+	| "memory.backend"
+	| "mnemopi.scoping"
+	| "mnemopi.autoRecall"
+	| "mnemopi.autoRetain"
+	| "hindsight.apiUrl"
+	| "hindsight.bankId"
+	| "hindsight.scoping"
+	| "hindsight.autoRecall"
+	| "hindsight.autoRetain"
+	| "hindsight.mentalModelsEnabled";
+
+/** One selectable value for an enum-typed governed memory setting. */
+export interface MemorySettingOption {
+	value: string;
+	label: string;
+	description?: string;
+}
+
+/** Wire value for a governed policy setting — scalars plus the two record-shaped keys (`modelRoles`, `retry.fallbackChains`). */
+export type PolicySettingValue = number | string | boolean | Record<string, string> | Record<string, string[]>;
+
+/** Current value + OMP schema metadata for one governed policy setting. */
+export interface PolicySettingEntry {
+	key: PolicySettingKey;
+	type: "number" | "enum" | "boolean" | "record";
+	value: PolicySettingValue;
+	/** Schema default, `null` when the schema declares none. */
+	defaultValue: PolicySettingValue | null;
+	/** True when explicitly set in OMP config (vs falling back to the schema default). */
+	configured: boolean;
+	/** Effective-value source resolved by the public OMP Settings contract. */
+	origin: "omp-config" | "schema-default";
+	/** Label/description/options come verbatim from OMP's settings schema. */
+	label: string;
+	description: string;
+	options?: PolicySettingOption[];
+}
+
+/** A model role OMP knows about — built-in or custom — for the `modelRoles` editor. */
+export interface PolicyModelRoleInfo {
+	id: string;
+	name: string;
+	tag?: string;
+	/** Currently assigned model selector for this role, if any (mirrors `settings[key="modelRoles"].value[id]`). */
+	assignedModel?: string;
+}
+
+/** `GET /api/policies/settings` response. */
+export interface GetPolicySettingsResponse {
+	settings: PolicySettingEntry[];
+	/** Known model roles (built-ins first, then any custom roles configured), for the `modelRoles` editor. */
+	roles: PolicyModelRoleInfo[];
+	/** Absolute path of the OMP config file these values persist to. */
+	configPath: string;
+}
+
+/** Current value + OMP schema metadata for one governed memory setting. */
+export interface MemorySettingEntry {
+	key: MemorySettingKey;
+	type: "string" | "number" | "enum" | "boolean";
+	value: number | string | boolean;
+	/** Schema default, `null` when the schema declares none. */
+	defaultValue: number | string | boolean | null;
+	/** True when explicitly set in OMP config (vs falling back to the schema default). */
+	configured: boolean;
+	label: string;
+	description: string;
+	options?: MemorySettingOption[];
+}
+
+/** `GET /api/memory/settings` response. */
+export interface GetMemorySettingsResponse {
+	settings: MemorySettingEntry[];
+	/** Absolute path of the OMP config file these values persist to. */
+	configPath: string;
+}
+
+/** `PATCH /api/policies/settings` request. Unknown keys are rejected. */
+export interface PatchPolicySettingsRequest {
+	updates: Partial<Record<PolicySettingKey, PolicySettingValue>>;
+}
+
+/** `PATCH /api/policies/settings` response — fresh post-write state. */
+export type PatchPolicySettingsResponse = GetPolicySettingsResponse;
+
+/** `PATCH /api/memory/settings` request. Unknown keys are rejected. */
+export interface PatchMemorySettingsRequest {
+	updates: Partial<Record<MemorySettingKey, number | string | boolean>>;
+}
+
+/** `PATCH /api/memory/settings` response — fresh post-write state. */
+export type PatchMemorySettingsResponse = GetMemorySettingsResponse;
+
+export type MemoryBackendId = "off" | "local" | "hindsight" | "mnemopi";
+
+/**
+ * `GET /api/memory/scope?cwd=` response. Reports which backend is active
+ * process-wide and, for the currently explorable one (Hindsight — the only
+ * backend with a sessionless, credential-safe HTTP API), the bank a given
+ * project resolves to under the configured scoping policy.
+ *
+ * Mnemopi (local SQLite) and the local summary pipeline have no sessionless
+ * read/write seam in the SDK — data-level browsing there requires a live
+ * OMP agent session, which the deck does not fabricate. `explorable` is
+ * `false` for those, with `message` explaining why.
+ */
+export interface MemoryScopeStatus {
+	cwd: string;
+	backend: MemoryBackendId;
+	/** True when the active backend has a sessionless read/write API this deck can call. */
+	explorable: boolean;
+	/** Hindsight only: resolved bank id for this project under the current scoping policy. */
+	bankId?: string;
+	scoping?: string;
+	message?: string;
+}
+
+/** One Hindsight recall hit — mirrors the SDK's `RecallResult` verbatim. */
+export interface HindsightRecallItem {
+	id?: string;
+	text: string;
+	type?: string | null;
+	mentioned_at?: string | null;
+	[key: string]: unknown;
+}
+
+/** `POST /api/memory/hindsight/recall?cwd=` response — traceable recall results for a query. */
+export interface HindsightRecallResponse {
+	bankId: string;
+	query: string;
+	results: HindsightRecallItem[];
+}
+
+/** `POST /api/memory/hindsight/recall?cwd=` request. */
+export interface HindsightRecallRequest {
+	query: string;
+	budget?: "low" | "mid" | "high";
+	maxTokens?: number;
+}
+
+/**
+ * `GET /api/memory/hindsight/memories?cwd=` response. Raw pass-through of
+ * the Hindsight bulk-list endpoint — the SDK's own client leaves this shape
+ * as `[key: string]: unknown`, so the deck renders it generically rather
+ * than fabricating a stronger contract the upstream API doesn't guarantee.
+ */
+export interface HindsightListMemoriesResponse {
+	bankId: string;
+	[key: string]: unknown;
+}
+
+/** `GET /api/memory/hindsight/documents?cwd=` response — same pass-through rationale. */
+export interface HindsightListDocumentsResponse {
+	bankId: string;
+	[key: string]: unknown;
+}
+
+/** A single Hindsight document, as returned by get/update. */
+export interface HindsightDocument {
+	[key: string]: unknown;
+}
+
+/** `PATCH /api/memory/hindsight/documents/:id?cwd=` request — the only mutable field is tags. */
+export interface UpdateHindsightDocumentRequest {
+	tags: string[];
+}
+
+/** `DELETE /api/memory/hindsight/documents/:id?cwd=` response. */
+export interface DeleteHindsightDocumentResponse {
+	ok: boolean;
+}
+
+/** One Hindsight mental model — mirrors the SDK's `MentalModelSummary` verbatim. */
+export interface HindsightMentalModel {
+	id: string;
+	bank_id: string;
+	name: string;
+	tags?: string[];
+	last_refreshed_at?: string | null;
+	created_at?: string | null;
+	source_query?: string;
+	content?: string;
+	max_tokens?: number;
+	[key: string]: unknown;
+}
+
+/** `GET /api/memory/hindsight/mental-models?cwd=` response. */
+export interface ListHindsightMentalModelsResponse {
+	bankId: string;
+	items: HindsightMentalModel[];
+}
+
+/** `POST /api/memory/hindsight/mental-models?cwd=` request. */
+export interface CreateHindsightMentalModelRequest {
+	name: string;
+	sourceQuery: string;
+	tags?: string[];
+	maxTokens?: number;
+}
+
+/** `POST /api/memory/hindsight/mental-models?cwd=` response. */
+export interface CreateHindsightMentalModelResponse {
+	operation_id?: string;
+	[key: string]: unknown;
+}
+
+/** `POST /api/memory/hindsight/mental-models/:id/refresh?cwd=` response. */
+export interface RefreshHindsightMentalModelResponse {
+	operation_id?: string;
+	[key: string]: unknown;
+}
+
+/** `DELETE /api/memory/hindsight/mental-models/:id?cwd=` response. */
+export interface DeleteHindsightMentalModelResponse {
+	ok: boolean;
 }

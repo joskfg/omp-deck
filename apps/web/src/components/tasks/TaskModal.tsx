@@ -1,14 +1,20 @@
-import { useEffect, useMemo, useState } from "react";
-import { Archive, Bot, CheckCircle2, Circle, Link2, MessageSquarePlus, RotateCcw, Trash2, Wand2, X, Zap } from "lucide-react";
-import type { Task, TaskPriority, TaskState } from "@omp-deck/protocol";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Archive, Bot, CheckCircle2, Circle, FolderOpen, Link2, MessageSquarePlus, RotateCcw, Trash2, Wand2, X, Zap } from "lucide-react";
+import type { Task, TaskDifficulty, TaskPriority, TaskState } from "@omp-deck/protocol";
 
 import { MarkdownEdit } from "@/components/MarkdownEdit";
 import { Modal } from "@/components/ui/Modal";
 import { candidateDependencyTasks, resolveDependencyTasks, resolveDependentTasks } from "@/lib/task-dependencies";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { DirBrowserModal } from "@/components/DirBrowserModal";
 
 const PRIORITIES: TaskPriority[] = ["P0", "P1", "P2", "P3", "P4", "P5"];
+const DIFFICULTIES: { value: TaskDifficulty; label: string }[] = [
+	{ value: "easy", label: "easy" },
+	{ value: "medium", label: "medium" },
+	{ value: "hard", label: "hard" },
+];
 
 interface Props {
 	task: Task | null;
@@ -22,6 +28,7 @@ interface Props {
 		stateId?: string;
 		cwd?: string;
 		priority?: TaskPriority;
+		difficulty?: TaskDifficulty;
 		dependsOn?: string[];
 		autoWork?: boolean;
 	}) => void;
@@ -58,6 +65,7 @@ export function TaskModal({
 	const [title, setTitle] = useState("");
 	const [stateId, setStateId] = useState("");
 	const [cwd, setCwd] = useState("");
+	const [cwdBrowserOpen, setCwdBrowserOpen] = useState(false);
 
 	useEffect(() => {
 		if (!task) return;
@@ -67,17 +75,20 @@ export function TaskModal({
 	}, [task]);
 	// Rewrite state: null = idle, loading = in-flight, RewriteTaskResponse = preview pending
 	const [rewrite, setRewrite] = useState<{ title: string; body: string } | "loading" | null>(null);
+	const activeTaskIdRef = useRef<string | null>(task?.id ?? null);
 
 	async function triggerRewrite(): Promise<void> {
 		if (!task || rewrite === "loading") return;
 		setRewrite("loading");
 		try {
 			const result = await api.rewriteTask(task.id);
-			setRewrite(result);
+			if (activeTaskIdRef.current === task.id) setRewrite(result);
 		} catch (err) {
-			setRewrite(null);
-			// Surface the error to the user as a dismissible note inline.
-			setRewriteError(err instanceof Error ? err.message : String(err));
+			if (activeTaskIdRef.current === task.id) {
+				setRewrite(null);
+				// Surface the error to the user as a dismissible note inline.
+				setRewriteError(err instanceof Error ? err.message : String(err));
+			}
 		}
 	}
 	const [rewriteError, setRewriteError] = useState<string | null>(null);
@@ -106,6 +117,7 @@ export function TaskModal({
 
 	// Clear rewrite preview/error when a new task opens.
 	useEffect(() => {
+		activeTaskIdRef.current = task?.id ?? null;
 		setRewrite(null);
 		setRewriteError(null);
 	}, [task?.id]);
@@ -125,11 +137,19 @@ export function TaskModal({
 		if (!task || next === task.priority) return;
 		onSave({ priority: next });
 	}
+	function commitDifficulty(next: TaskDifficulty): void {
+		if (!task || next === task.difficulty) return;
+		onSave({ difficulty: next });
+	}
 	function commitCwd(): void {
 		if (!task) return;
 		const next = cwd.trim() || undefined;
 		if ((task.cwd ?? "") !== (next ?? "")) onSave({ cwd: next });
 	}
+	// Auto Work needs a repo to run in: block enabling the flag until the task
+	// names a workspace. Mirrors the server-side invariant (autoWork ⇒ cwd).
+	// Turning the flag OFF stays allowed for legacy cwd-less rows.
+	const autoWorkToggleBlocked = task !== null && !task.autoWork && cwd.trim().length === 0;
 	function addDependency(depId: string): void {
 		if (!task || !depId || task.dependsOn.includes(depId)) return;
 		onSave({ dependsOn: [...task.dependsOn, depId] });
@@ -142,6 +162,7 @@ export function TaskModal({
 	const isArchived = Boolean(task.archivedAt);
 
 	return (
+		<>
 		<Modal open={open} onClose={onClose} widthClass="max-w-3xl">
 			{/* Single scrollable wrapper — only the action bar (sticky) stays visible at all
 			    viewport heights; title, metadata, and body all scroll together so the body
@@ -181,6 +202,18 @@ export function TaskModal({
 						{PRIORITIES.map((p) => (
 							<option key={p} value={p}>
 								{p}
+							</option>
+						))}
+					</select>
+					<select
+						value={task.difficulty}
+						onChange={(e) => commitDifficulty(e.target.value as TaskDifficulty)}
+						title="Difficulty — affects auto-work agent selection"
+						className="field h-8 px-2 font-mono text-2xs uppercase tracking-meta"
+					>
+						{DIFFICULTIES.map((d) => (
+							<option key={d.value} value={d.value}>
+								{d.label}
 							</option>
 						))}
 					</select>
@@ -246,22 +279,45 @@ export function TaskModal({
 						<span className="text-ink-4">updated</span>
 						<span>{new Date(task.updatedAt).toLocaleString()}</span>
 						<span className="text-ink-4">cwd</span>
-						<span className="col-span-3">
+						<span className="col-span-3 flex items-center gap-1">
 							<input
 								value={cwd}
 								onChange={(e) => setCwd(e.target.value)}
 								onBlur={commitCwd}
 								placeholder="(defaults to server cwd)"
-								className="w-full bg-transparent font-mono text-2xs text-ink placeholder:text-ink-4 focus:outline-none"
+								className="min-w-0 flex-1 bg-transparent font-mono text-2xs text-ink placeholder:text-ink-4 focus:outline-none"
 							/>
+							<button
+								type="button"
+								onClick={() => setCwdBrowserOpen(true)}
+								className="shrink-0 rounded p-0.5 text-ink-4 hover:text-ink"
+								title="Browse for folder"
+							>
+								<FolderOpen className="h-3.5 w-3.5" />
+							</button>
 						</span>
 						<span className="text-ink-4">auto work</span>
 						<span className="col-span-3">
-							<label className="inline-flex cursor-pointer items-center gap-1.5 text-ink-2">
+							<label
+								className={cn(
+									"inline-flex items-center gap-1.5 text-ink-2",
+									autoWorkToggleBlocked ? "cursor-not-allowed opacity-60" : "cursor-pointer",
+								)}
+								title={autoWorkToggleBlocked ? "Assign a workspace (cwd) above first — Auto Work needs a repo to run in" : undefined}
+							>
 								<input
 									type="checkbox"
 									checked={task.autoWork}
-									onChange={(e) => onSave({ autoWork: e.target.checked })}
+									disabled={autoWorkToggleBlocked}
+									onChange={(e) => {
+										const patch: { autoWork: boolean; cwd?: string } = { autoWork: e.target.checked };
+										const trimmed = cwd.trim();
+										// A cwd typed but not yet committed via blur travels in the
+										// same atomic patch, so the server invariant (autoWork ⇒ cwd)
+										// never rejects the toggle.
+										if (e.target.checked && trimmed && trimmed !== task.cwd) patch.cwd = trimmed;
+										onSave(patch);
+									}}
 									className="h-3.5 w-3.5 rounded-sm border-line accent-accent"
 								/>
 								<Zap className="h-3.5 w-3.5 shrink-0 text-accent" />
@@ -413,6 +469,19 @@ export function TaskModal({
 				</div>
 			</div>
 		</Modal>
+		<DirBrowserModal
+			open={cwdBrowserOpen}
+			initialPath={cwd || undefined}
+			onClose={() => setCwdBrowserOpen(false)}
+			onSelect={(selected) => {
+				setCwdBrowserOpen(false);
+				setCwd(selected);
+				if (!task) return;
+				const next = selected.trim() || undefined;
+				if ((task.cwd ?? "") !== (next ?? "")) onSave({ cwd: next });
+			}}
+		/>
+		</>
 	);
 }
 

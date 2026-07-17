@@ -33,6 +33,109 @@ function userMessageStart(text: string, synthetic = false) {
 	} as never;
 }
 
+describe("reducer session_handoff event (T-32)", () => {
+	function handoffEvent(over: Partial<Record<string, unknown>> = {}) {
+		return {
+			type: "session_handoff",
+			reason: "threshold",
+			previousSessionId: "old-id",
+			previousSessionFile: "/tmp/old.jsonl",
+			newSessionId: "new-id",
+			newSessionFile: "/tmp/new.jsonl",
+			timestamp: 1700000000000,
+			...over,
+		} as never;
+	}
+
+	test("appends a HandoffMsg carrying the why/when/new-identity", () => {
+		const state = applyEvent(fresh(), handoffEvent());
+
+		expect(state.messages).toHaveLength(1);
+		expect(state.messages[0]).toMatchObject({
+			role: "handoff",
+			reason: "threshold",
+			previousSessionId: "old-id",
+			previousSessionFile: "/tmp/old.jsonl",
+			newSessionId: "new-id",
+			newSessionFile: "/tmp/new.jsonl",
+			timestamp: 1700000000000,
+		});
+	});
+
+	test("this tab's own sessionId never changes, but sessionFile/parentSessionPath follow the swap", () => {
+		const before = fresh();
+		const state = applyEvent(before, handoffEvent());
+
+		expect(state.sessionId).toBe(before.sessionId);
+		expect(state.sessionFile).toBe("/tmp/new.jsonl");
+		expect(state.parentSessionPath).toBe("/tmp/old.jsonl");
+	});
+
+	test("a second handoff on the same tab keeps appending and keeps sessionFile current", () => {
+		let state = applyEvent(fresh(), handoffEvent());
+		state = applyEvent(
+			state,
+			handoffEvent({ reason: "overflow", previousSessionId: "new-id", previousSessionFile: "/tmp/new.jsonl", newSessionId: "newer-id", newSessionFile: "/tmp/newer.jsonl" }),
+		);
+
+		expect(state.messages.filter((m) => m.role === "handoff")).toHaveLength(2);
+		expect(state.sessionFile).toBe("/tmp/newer.jsonl");
+		expect(state.parentSessionPath).toBe("/tmp/new.jsonl");
+	});
+});
+
+describe("reducer handoff_origin ingestion (T-32)", () => {
+	test("reconstructs the transferred summary from the persisted custom_message handoff marker", () => {
+		const state = initSession({
+			sessionId: "s1",
+			cwd: "/tmp/x",
+			isStreaming: false,
+			todoPhases: [],
+			messages: [
+				{
+					role: "custom",
+					customType: "handoff",
+					content: "<handoff-context>\nWe were mid-refactor on foo.ts.\n</handoff-context>\n\nThe above is a handoff document from a previous session. Use this context to continue the work seamlessly.",
+					timestamp: 1700000000000,
+				} as never,
+			],
+		});
+
+		expect(state.messages).toHaveLength(1);
+		expect(state.messages[0]).toMatchObject({
+			role: "handoff_origin",
+			document: "We were mid-refactor on foo.ts.",
+			timestamp: 1700000000000,
+		});
+	});
+
+	test("falls back to the raw content when the wrapper tags are absent (forward-compat)", () => {
+		const state = initSession({
+			sessionId: "s1",
+			cwd: "/tmp/x",
+			isStreaming: false,
+			todoPhases: [],
+			messages: [
+				{ role: "custom", customType: "handoff", content: "plain text, no wrapper", timestamp: 1 } as never,
+			],
+		});
+
+		expect(state.messages[0]).toMatchObject({ role: "handoff_origin", document: "plain text, no wrapper" });
+	});
+
+	test("ignores a custom message of any other customType", () => {
+		const state = initSession({
+			sessionId: "s1",
+			cwd: "/tmp/x",
+			isStreaming: false,
+			todoPhases: [],
+			messages: [{ role: "custom", customType: "advisor", content: "some note", timestamp: 1 } as never],
+		});
+
+		expect(state.messages).toHaveLength(0);
+	});
+});
+
 describe("reducer queue lifecycle", () => {
 	test("prompt_queued appends a QueuedPrompt with the server id", () => {
 		const s1 = applyEvent(fresh(), queueEvent("first", "abc"));
@@ -424,5 +527,80 @@ describe("trimHistory", () => {
 		expect(srcIndexes(trimmed)).toEqual([3, 5]);
 		expect(trimmed.historyStartIndex).toBe(3);
 		expect(Object.keys(trimmed.toolCalls)).toEqual(["t2"]);
+	});
+});
+
+// ─── T-97: Codex sub-agent cost display ────────────────────────────────────
+
+/** A task `tool_execution_end` event carrying sub-agent results with the full
+ *  SDK `usage` shape (`cost` as an object). Uses a non-zero `cost.total` so
+ *  any accidental serialisation or extraction bug is detectable. */
+function taskEndEvent(costTotal: number, tokens: number, isError = false): never {
+	const usage = {
+		input: 1000,
+		output: 200,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 1200,
+		cost: { input: 0.01, output: 0.032, cacheRead: 0, cacheWrite: 0, total: costTotal },
+	};
+	return {
+		type: "tool_execution_end",
+		toolCallId: "tc-task-1",
+		toolName: "task",
+		isError,
+		result: {
+			content: [{ type: "text", text: "done" }],
+			details: {
+				projectAgentsDir: null,
+				results: [
+					{
+						index: 0,
+						id: "Worker1",
+						agent: "task",
+						agentSource: "bundled",
+						tokens,
+						requests: 3,
+						exitCode: 0,
+						durationMs: 8000,
+						usage,
+					},
+				],
+				totalDurationMs: 8000,
+				usage,
+			},
+		},
+	} as never;
+}
+
+describe("T-97: task tool sub-agent cost display (Codex fixture)", () => {
+	test("sub-agent result row: tokens and usage.cost survive the reducer unchanged", () => {
+		const state = applyEvent(fresh(), taskEndEvent(0.042, 5432));
+		const result = state.toolCalls["tc-task-1"]?.result as Record<string, unknown> | undefined;
+		expect(result).toBeDefined();
+		const details = result?.details as Record<string, unknown> | undefined;
+		const results = details?.results as Array<Record<string, unknown>> | undefined;
+		expect(Array.isArray(results) && results.length).toBe(1);
+		const row = results?.[0];
+		expect(row?.tokens).toBe(5432);
+		const rowUsage = row?.usage as Record<string, unknown> | undefined;
+		const rowCost = rowUsage?.cost as Record<string, unknown> | undefined;
+		expect(rowCost?.total).toBe(0.042);
+	});
+
+	test("parent CostStrip: details.usage.cost.total is rolled into session usage", () => {
+		const state = applyEvent(fresh(), taskEndEvent(0.042, 5432));
+		// Without the fix this is 0 — the bug: rollupUsage is never called from tool_execution_end.
+		expect(state.usage.cost).toBeCloseTo(0.042, 6);
+	});
+
+	test("parent CostStrip: details.usage tokens are rolled in alongside cost", () => {
+		const state = applyEvent(fresh(), taskEndEvent(0.042, 5432));
+		expect(state.usage.totalTokens).toBe(1200);
+	});
+
+	test("parent CostStrip: errors do not roll up sub-agent usage", () => {
+		const state = applyEvent(fresh(), taskEndEvent(0.042, 5432, true));
+		expect(state.usage.cost).toBe(0);
 	});
 });

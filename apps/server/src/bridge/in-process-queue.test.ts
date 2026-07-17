@@ -30,6 +30,7 @@ class StubSession {
 	model = undefined;
 	thinkingLevel = undefined;
 	messages: unknown[] = [];
+	setThinkingLevelCalls: unknown[] = [];
 
 	#steering: QueueEntry[] = [];
 	#followUp: QueueEntry[] = [];
@@ -76,6 +77,10 @@ class StubSession {
 	}
 
 	async dispose(): Promise<void> {}
+
+	setThinkingLevel(level: unknown): void {
+		this.setThinkingLevelCalls.push(level);
+	}
 }
 
 function makeHandle(branch: unknown[] = []): { handle: InProcessSessionHandle; session: StubSession; emitted: unknown[] } {
@@ -83,7 +88,7 @@ function makeHandle(branch: unknown[] = []): { handle: InProcessSessionHandle; s
 	const emitted: unknown[] = [];
 	const handle = new InProcessSessionHandle({
 		session: session as unknown as never,
-		sessionManager: { getBranch: () => branch } as never,
+		sessionManager: { getBranch: () => branch, getHeader: () => undefined } as never,
 		cwd: "/tmp/stub",
 		sessionId: "stub-1",
 		getModelRegistry: async () => ({}) as never,
@@ -94,6 +99,7 @@ function makeHandle(branch: unknown[] = []): { handle: InProcessSessionHandle; s
 			dispose() {},
 			getPlanModeContext: () => undefined,
 			getPendingPlanApproval: () => undefined,
+			getPendingPlanExecution: () => undefined,
 		} as never,
 		goalBridge: {
 			getContext: () => undefined,
@@ -235,5 +241,14 @@ describe("InProcessSessionHandle queue shadow", () => {
 		expect(handle.snapshot().todoPhases).toEqual([
 			{ name: "Done", tasks: [{ content: "Ship it", status: "completed" }] },
 		]);
+	});
+
+	test("setThinkingLevel rejects a streaming turn before invoking the SDK setter", async () => {
+		const { handle, session, emitted } = makeHandle();
+
+		await expect(handle.setThinkingLevel("low")).rejects.toThrow("thinking cannot change while a turn is streaming");
+
+		expect(session.setThinkingLevelCalls).toEqual([]);
+		expect(emitted).toHaveLength(0);
 	});
 });

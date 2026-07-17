@@ -195,6 +195,20 @@ export class RoutinesRunner {
 		if (decision.kind === "cancel") {
 			decision.toCancel.abort();
 		}
+		if (decision.kind === "queue") {
+			await decision.release;
+			if (decision.abort.signal.aborted) {
+				const endedAt = new Date().toISOString();
+				finalizeRun(run.id, {
+					endedAt,
+					abortedAt: endedAt,
+					abortReason: "cancelled",
+					error: "aborted: cancelled",
+				});
+				this.concurrency.finish(routine.id, run.id);
+				return;
+			}
+		}
 
 		log.info(`firing V1 routine ${routine.name} (${spec.steps.length} steps, trigger=${trigger})`);
 		const config = loadConfig();

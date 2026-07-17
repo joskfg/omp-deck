@@ -13,9 +13,10 @@ import {
 	SortableContext,
 	horizontalListSortingStrategy,
 } from "@dnd-kit/sortable";
-import { ArrowDownWideNarrow, Settings2 } from "lucide-react";
+import { Archive, ArrowDownWideNarrow, Settings2 } from "lucide-react";
+import { DirBrowserModal } from "@/components/DirBrowserModal";
 
-import type { Task, TaskPriority, TaskState } from "@omp-deck/protocol";
+import type { ModelRef, Task, TaskDifficulty, TaskPriority, TaskState } from "@omp-deck/protocol";
 
 import { Layout } from "@/components/Layout";
 import { Column } from "@/components/tasks/Column";
@@ -23,6 +24,7 @@ import { TaskCardBody } from "@/components/tasks/TaskCard";
 import { TaskModal } from "@/components/tasks/TaskModal";
 import { SessionLaunchModal, type SessionLaunchOpts } from "@/components/chat/SessionLaunchModal";
 import { StateConfig } from "@/components/tasks/StateConfig";
+import { ArchivedTasksModal } from "@/components/tasks/ArchivedTasksModal";
 import { projectColorForCwd, useProjectColors } from "@/lib/project-colors";
 import {
 	filterTasksByWorkspace,
@@ -33,6 +35,7 @@ import { tasksApi } from "@/lib/tasks-api";
 import { useStore } from "@/lib/store";
 import { cn, shortPath } from "@/lib/utils";
 import { usePersistedViewState } from "@/lib/use-persisted-view-state";
+import { api } from "@/lib/api";
 
 export function TasksView() {
 	const navigate = useNavigate();
@@ -51,9 +54,11 @@ export function TasksView() {
 
 	const [openTask, setOpenTask] = useState<Task | undefined>();
 	const [launchTarget, setLaunchTarget] = useState<
-		{ task: Task; draft: "full" | "short" } | undefined
+		{ task: Task; draft: "full" | "short"; suggestedModel?: ModelRef } | undefined
 	>();
 	const [showStateConfig, setShowStateConfig] = useState(false);
+	const [showArchivedModal, setShowArchivedModal] = useState(false);
+	const [cwdPickerTask, setCwdPickerTask] = useState<Task | null>(null);
 	const { colors: projectColors, setColor: setProjectColor } = useProjectColors();
 
 	const sensors = useSensors(
@@ -287,12 +292,46 @@ export function TasksView() {
 		await refresh();
 	}
 
+	async function pickCwd(path: string): Promise<void> {
+		if (!cwdPickerTask) return;
+		const taskId = cwdPickerTask.id;
+		setCwdPickerTask(null);
+		try {
+			const updated = await tasksApi.update(taskId, { cwd: path });
+			setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+		} catch (e) {
+			setError(String(e));
+		}
+	}
+
 	function openInChat(task: Task): void {
 		setLaunchTarget({ task, draft: "full" });
 	}
 
-	function sendToAgent(task: Task): void {
-		setLaunchTarget({ task, draft: "short" });
+	async function sendToAgent(task: Task): Promise<void> {
+		let suggestedModel: ModelRef | undefined;
+		if (task.cwd) {
+			try {
+				const [wsConfig, globalConfig] = await Promise.all([
+					api.getAutoWorkConfig(task.cwd),
+					api.getAutoWorkGlobalConfig(),
+				]);
+				// Mirror engine cascade: workspace difficulty↓ → global difficulty↓ → undefined
+				const cascade: TaskDifficulty[] = ["hard", "medium", "easy"];
+				const startIdx = cascade.indexOf(task.difficulty);
+				for (let i = startIdx; i < cascade.length && !suggestedModel; i++) {
+					const m = wsConfig.modelByDifficulty[cascade[i]!];
+					if (m) suggestedModel = m;
+				}
+				for (let i = startIdx; i < cascade.length && !suggestedModel; i++) {
+					const m = globalConfig.modelByDifficulty[cascade[i]!];
+					if (m) suggestedModel = m;
+				}
+			} catch {
+				// Best-effort — ignore fetch errors, the user can still pick manually.
+			}
+		}
+		setLaunchTarget({ task, draft: "short", suggestedModel });
 	}
 
 	async function confirmLaunch(opts: SessionLaunchOpts): Promise<void> {
@@ -385,6 +424,15 @@ export function TasksView() {
 								<Settings2 className="h-3.5 w-3.5" />
 								Board
 							</button>
+							<button
+								type="button"
+								onClick={() => setShowArchivedModal(true)}
+								className="btn-ghost h-7 px-2 text-xs"
+								title="Ver tareas archivadas"
+							>
+								<Archive className="h-3.5 w-3.5" />
+								Archived
+							</button>
 						</div>
 
 						{error ? (
@@ -417,6 +465,7 @@ export function TasksView() {
 												projectColors={projectColors}
 												onCreate={(stateId, title) => void onCreate(stateId, title)}
 												onOpen={(t) => setOpenTask(t)}
+												onPickCwd={(t) => setCwdPickerTask(t)}
 												onRenameRequest={() => {
 													setShowStateConfig(true);
 													setInspectorOpen(true);
@@ -506,9 +555,22 @@ export function TasksView() {
 				title={launchTarget?.draft === "short" ? `Assign to agent — T-${launchTarget.task.displayId}` : "Open in chat"}
 				confirmLabel="Open chat"
 				initialCwd={launchTarget?.task.cwd || defaultCwd}
+				initialModel={launchTarget?.draft === "short" ? launchTarget?.suggestedModel : undefined}
 				showInitialPrompt={false}
 				onCancel={() => setLaunchTarget(undefined)}
 				onConfirm={confirmLaunch}
+			/>
+			<ArchivedTasksModal
+				open={showArchivedModal}
+				onClose={() => setShowArchivedModal(false)}
+				states={states}
+				onRestored={() => void refresh()}
+			/>
+			<DirBrowserModal
+				open={cwdPickerTask !== null}
+				initialPath={cwdPickerTask?.cwd ?? undefined}
+				onClose={() => setCwdPickerTask(null)}
+				onSelect={(path) => void pickCwd(path)}
 			/>
 		</>
 	);

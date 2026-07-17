@@ -166,6 +166,23 @@ interface PendingExecution {
 }
 
 /**
+ * Durable snapshot of a pending approval (T-29), written into the session's
+ * `mode_change` data so a restart can re-emit the proposal. The plan content
+ * itself is NOT duplicated here — it is re-read from the durable plan file.
+ */
+export interface PersistedPlanProposal {
+	proposalId: string;
+	suggestedTitle: string;
+	suggestedFinalPath: string;
+}
+
+/** Shape of the `mode_change` data the deck persists for `mode: "plan"`. */
+export interface PersistedPlanModeData {
+	planFilePath?: string;
+	proposal?: PersistedPlanProposal;
+}
+
+/**
  * Minimal `AgentSession` surface this bridge needs. Listed here as a
  * structural interface so tests can substitute a hand-rolled fake without
  * spinning up the full SDK.
@@ -231,6 +248,12 @@ export interface PlanModeBridgeArgs {
 	getSessionId: () => string | null;
 	/** Controls the plan-role model override. Omit to disable model switching. */
 	planModel?: PlanModelController;
+	/**
+	 * Durable mode persistence (T-29) — SDK `sessionManager.appendModeChange`.
+	 * Called on enter ("plan"), user/approval exit ("none"), and proposal
+	 * creation ("plan" + proposal marker). Omit to disable persistence.
+	 */
+	persistModeChange?: (mode: "plan" | "none", data?: Record<string, unknown>) => void;
 }
 
 /** Bridge over the SDK's plan-mode primitives, scoped to one session. */
@@ -240,6 +263,7 @@ export class PlanModeBridge {
 	private readonly getArtifactsDir: () => string | null;
 	private readonly getSessionId: () => string | null;
 	private readonly planModel: PlanModelController | undefined;
+	private readonly persistModeChange: PlanModeBridgeArgs["persistModeChange"];
 	private readonly listeners = new Set<FrameListener>();
 	private nextProposalCounter = 1;
 	private enabled = false;
@@ -267,6 +291,7 @@ export class PlanModeBridge {
 		this.getArtifactsDir = args.getArtifactsDir;
 		this.getSessionId = args.getSessionId;
 		this.planModel = args.planModel;
+		this.persistModeChange = args.persistModeChange;
 	}
 
 	// ─── Snapshot + replay surface (consumed by InProcessAgentBridge) ─────
@@ -376,7 +401,39 @@ export class PlanModeBridge {
 		if (this.pendingExecution) {
 			throw new Error("Finish or recover the approved plan execution before entering Plan Mode again.");
 		}
+		await this.#activatePlanMode(PLAN_FILE_URL);
+		this.#persistMode("plan", { planFilePath: this.planFilePath });
+	}
 
+	/**
+	 * T-29: rehydrate plan mode on session resume from the durable
+	 * `mode_change` entry the deck wrote on enter. Restores the SDK plan
+	 * state (resolve workflow, standing handler, plan-model override) and,
+	 * when a proposal was pending at shutdown, re-emits it from the durable
+	 * plan file so the approval is never silently lost. Best-effort: a
+	 * restore failure logs, clears the persisted mode (so a later resume
+	 * doesn't loop on a broken state), and leaves the session usable in
+	 * normal mode. Never throws.
+	 */
+	async restore(persisted?: PersistedPlanModeData): Promise<void> {
+		if (this.disposed || this.enabled) return;
+		try {
+			await this.#activatePlanMode(
+				typeof persisted?.planFilePath === "string" && persisted.planFilePath.length > 0
+					? persisted.planFilePath
+					: PLAN_FILE_URL,
+			);
+		} catch (err) {
+			log.warn(`plan mode restore failed for ${this.sessionId} — continuing without plan mode`, err);
+			this.#persistMode("none");
+			return;
+		}
+		log.info(`plan mode restored for ${this.sessionId} (plan file ${this.planFilePath})`);
+		if (persisted?.proposal) await this.#restoreProposal(persisted.proposal);
+	}
+
+	/** Shared enter/restore body: tools, SDK plan state, standing handler, model override, frame. */
+	async #activatePlanMode(planFilePath: string): Promise<void> {
 		const previousTools = this.session.getActiveToolNames();
 		const planTools = previousTools.includes(RESOLVE_TOOL)
 			? previousTools
@@ -384,7 +441,7 @@ export class PlanModeBridge {
 		await this.session.setActiveToolsByName(planTools);
 
 		this.previousTools = previousTools;
-		this.planFilePath = PLAN_FILE_URL;
+		this.planFilePath = planFilePath;
 		this.enabled = true;
 
 		this.session.setPlanModeState({
@@ -456,6 +513,12 @@ export class PlanModeBridge {
 			this.#broadcast(this.#planModeChangedFrame());
 		}
 
+		// A user-, approval- or rejection-driven exit clears the durable mode
+		// so a later resume doesn't restore a stale plan session. A dispose
+		// keeps it — that is exactly the state T-29 restores after a
+		// restart or reap.
+		if (reason !== "session_disposed") this.#persistMode("none");
+
 		log.info(`plan mode exited for ${this.sessionId} (${reason})`);
 	}
 
@@ -485,9 +548,11 @@ export class PlanModeBridge {
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
-		// Fire-and-forget — dispose is sync; the SDK call chain in exit() is
-		// best-effort during teardown.
-		void this.exit("session_disposed");
+		// Fire-and-forget — dispose is sync, and teardown failures must not
+		// become unhandled rejections.
+		void this.exit("session_disposed").catch((err) => {
+			log.warn(`plan mode disposal failed for ${this.sessionId}`, err);
+		});
 		this.listeners.clear();
 	}
 
@@ -692,6 +757,16 @@ export class PlanModeBridge {
 						suggestedTitle: normalized.title,
 						suggestedFinalPath,
 					});
+					// T-29: durable marker so a server restart/reap can re-emit
+					// this proposal instead of orphaning it.
+					this.#persistMode("plan", {
+						planFilePath: this.planFilePath,
+						proposal: {
+							proposalId,
+							suggestedTitle: normalized.title,
+							suggestedFinalPath,
+						} satisfies PersistedPlanProposal,
+					});
 				});
 
 				// Clear pending — anything after this point is post-decision.
@@ -869,6 +944,120 @@ export class PlanModeBridge {
 			getSessionId: this.getSessionId,
 		});
 		await fs.writeFile(fsPath, content, "utf-8");
+	}
+
+	/** Durable mode write, best-effort: persistence failure never breaks live plan mode. */
+	#persistMode(mode: "plan" | "none", data?: Record<string, unknown>): void {
+		if (!this.persistModeChange) return;
+		try {
+			this.persistModeChange(mode, data);
+		} catch (err) {
+			log.warn(`plan mode persistence failed for ${this.sessionId}`, err);
+		}
+	}
+
+	/**
+	 * Re-emit a proposal that was pending when the previous process died.
+	 * The original resolve-tool turn is gone, so the recovered approval's
+	 * settle path drives execution directly instead of unblocking a tool.
+	 */
+	async #restoreProposal(proposal: PersistedPlanProposal): Promise<void> {
+		let planContent: string | null = null;
+		try {
+			planContent = await this.#readPlanFile(this.planFilePath);
+		} catch (err) {
+			log.warn(`recovered proposal ${proposal.proposalId}: plan file read failed`, err);
+		}
+		if (planContent === null) {
+			log.warn(
+				`recovered proposal ${proposal.proposalId} dropped for ${this.sessionId}: plan file ${this.planFilePath} is gone`,
+			);
+			// Clear the orphan marker — plan mode stays active, but without a
+			// plan file this proposal can never be re-emitted again.
+			this.#persistMode("plan", { planFilePath: this.planFilePath });
+			return;
+		}
+		// Keep future proposal ids collision-free with the recovered one.
+		const counterMatch = /_(\d+)$/.exec(proposal.proposalId);
+		if (counterMatch) {
+			this.nextProposalCounter = Math.max(this.nextProposalCounter, Number(counterMatch[1]) + 1);
+		}
+		const content = planContent;
+		this.pendingApproval = {
+			proposalId: proposal.proposalId,
+			planFilePath: this.planFilePath,
+			planContent: content,
+			suggestedTitle: proposal.suggestedTitle,
+			suggestedFinalPath: proposal.suggestedFinalPath,
+			resolve: (resp) => {
+				this.#settleRecoveredApproval(proposal.proposalId, content, resp).catch((err) => {
+					log.warn(`recovered proposal ${proposal.proposalId} settle failed`, err);
+				});
+			},
+			// The dead process's resolve tool is not waiting on this — exit
+			// paths already broadcast the terminal frame, nothing to unblock.
+			reject: () => {},
+		};
+		this.#broadcast({
+			type: "plan_proposed",
+			sessionId: this.sessionId,
+			proposalId: proposal.proposalId,
+			planFilePath: this.planFilePath,
+			planContent: content,
+			suggestedTitle: proposal.suggestedTitle,
+			suggestedFinalPath: proposal.suggestedFinalPath,
+		});
+		log.info(`recovered pending plan proposal ${proposal.proposalId} for ${this.sessionId}`);
+	}
+
+	/**
+	 * Post-decision path for a recovered proposal (T-29). Mirrors the tail of
+	 * `#handlePlanResolve`'s apply callback, minus the tool result — the turn
+	 * that created the original proposal died with the previous process, so
+	 * approval dispatches the execution prompt directly.
+	 */
+	async #settleRecoveredApproval(
+		proposalId: string,
+		planContent: string,
+		userResponse: PlanApprovalResponse,
+	): Promise<void> {
+		const planFilePath = this.planFilePath;
+		if (!userResponse.approved) {
+			this.#broadcast({
+				type: "plan_proposal_resolved",
+				sessionId: this.sessionId,
+				proposalId,
+				outcome: "rejected",
+			});
+			await this.exit("rejected");
+			return;
+		}
+		let finalContent = planContent;
+		if (typeof userResponse.editedContent === "string") {
+			await this.#writePlanFile(planFilePath, userResponse.editedContent);
+			finalContent = userResponse.editedContent;
+		}
+		this.#broadcast({
+			type: "plan_proposal_resolved",
+			sessionId: this.sessionId,
+			proposalId,
+			outcome: "approved",
+		});
+		await this.exit("approved");
+		const pending: PendingExecution = {
+			proposalId,
+			planFilePath,
+			planContent: finalContent,
+			contextCompacted: false,
+			status: "compacting",
+		};
+		if (userResponse.executionStrategy === "compact_context") {
+			this.session.setPlanReferencePath(planFilePath);
+			this.#setPendingExecution(pending);
+			void this.#compactThenDispatch(pending);
+			return;
+		}
+		await this.#dispatchApprovedPlan(pending);
 	}
 
 	#allocateProposalId(): string {

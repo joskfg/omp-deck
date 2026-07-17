@@ -15,13 +15,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { AutoWorkConfig, ModelInfo, SessionSummary, Task, TaskPriority } from "@omp-deck/protocol";
+import type { AutoWorkConfig, AutoWorkGlobalConfig, ModelInfo, SessionSummary, Task, TaskDifficulty, TaskPriority } from "@omp-deck/protocol";
 
 import type { AgentBridge, CreateSessionOpts, EventListener, SessionHandle } from "../bridge/types.ts";
 import { broadcastBus } from "../broadcast-bus.ts";
-import { DEFAULT_AUTO_WORK_VALUES, setAutoWorkConfig } from "../db/auto-work.ts";
+import { DEFAULT_AUTO_WORK_VALUES, DEFAULT_MODEL_BY_DIFFICULTY, setAutoWorkConfig } from "../db/auto-work.ts";
+import { DEFAULT_AUTO_WORK_GLOBAL } from "../db/auto-work-global.ts";
 import { completeAutoWorkRun, getAutoWorkCostEstimate, listAutoWorkRuns, startAutoWorkRun } from "../db/auto-work-runs.ts";
-import { closeDb, openDb } from "../db/index.ts";
+import { closeDb, getDb, openDb } from "../db/index.ts";
 import { setInternalTaskModel } from "../db/server-settings.ts";
 import { createTask, getTask, moveTask } from "../db/tasks.ts";
 import { AUTO_WORK_RULES_BODY, BRANCH_NAMING_RULES_BODY } from "../kb-templates.ts";
@@ -47,6 +48,7 @@ import {
 	waitForAutoWorkSessionTerminal,
 } from "./engine.ts";
 import type { SqueezeDecisionInput } from "./engine.ts";
+import { SensitiveContentError } from "./pr-content-guard.ts";
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -73,6 +75,7 @@ function baseTask(overrides: Partial<Task> = {}): Task {
 		stateId: "s_backlog",
 		orderInState: taskSeq * 1000,
 		priority: "P5",
+		difficulty: "medium" as TaskDifficulty,
 		createdAt: "2026-01-01T00:00:00.000Z",
 		updatedAt: "2026-01-01T00:00:00.000Z",
 		stateEnteredAt: "2026-01-01T00:00:00.000Z",
@@ -402,37 +405,138 @@ describe("selectNextAutoWorkTask", () => {
 		});
 		expect(result).toEqual({ kind: "none_eligible" });
 	});
+	test("pinned: selects exactly the pinned task even when a higher-priority task exists", () => {
+		const p0 = baseTask({ priority: "P0" });
+		const pinned = baseTask({ priority: "P5" });
+		const result = selectNextAutoWorkTask({
+			tasks: [p0, pinned],
+			config: baseConfig(),
+			currentPctUsed: 0,
+			backlogStateId: "s_backlog",
+			doneStateId: "s_done",
+			estimateCostPct,
+			pinnedTaskId: pinned.id,
+		});
+		expect(result).toEqual({ kind: "selected", task: pinned, estimatedCostPct: 5 });
+	});
+
+	test("pinned: returns pinned_unavailable when the pinned task left the backlog", () => {
+		const eligible = baseTask();
+		const pinned = baseTask({ stateId: "s_active" });
+		const result = selectNextAutoWorkTask({
+			tasks: [eligible, pinned],
+			config: baseConfig(),
+			currentPctUsed: 0,
+			backlogStateId: "s_backlog",
+			doneStateId: "s_done",
+			estimateCostPct,
+			pinnedTaskId: pinned.id,
+		});
+		expect(result).toEqual({ kind: "pinned_unavailable" });
+	});
+
+	test("pinned: returns pinned_unavailable when the pinned task no longer fits the budget", () => {
+		const pinned = baseTask({ priority: "P0" });
+		const result = selectNextAutoWorkTask({
+			tasks: [pinned],
+			config: baseConfig(),
+			currentPctUsed: 60,
+			backlogStateId: "s_backlog",
+			doneStateId: "s_done",
+			estimateCostPct,
+			pinnedTaskId: pinned.id,
+		});
+		expect(result).toEqual({ kind: "pinned_unavailable" });
+	});
 });
 
 describe("resolveAutoWorkModel", () => {
-	test("prefers the per-priority override", () => {
+	const noGlobal: AutoWorkGlobalConfig = {
+		...DEFAULT_AUTO_WORK_GLOBAL,
+		updatedAt: "2026-01-01T00:00:00.000Z",
+	};
+
+	test("returns workspace difficulty mapping for exact match", () => {
 		const config = baseConfig({
-			modelByPriority: {
-				P0: { provider: "anthropic", id: "claude-p0" },
-				P1: null,
-				P2: null,
-				P3: null,
-				P4: null,
-				P5: null,
+			modelByDifficulty: {
+				...DEFAULT_MODEL_BY_DIFFICULTY,
+				hard: { provider: "anthropic", id: "claude-hard" },
 			},
 		});
-		expect(resolveAutoWorkModel("P0", config, { provider: "anthropic", id: "claude-ws" })).toEqual({
+		expect(resolveAutoWorkModel("hard", config, noGlobal, null)).toEqual({
 			provider: "anthropic",
-			id: "claude-p0",
+			id: "claude-hard",
 		});
 	});
 
-	test("falls back to the workspace default when no override is configured", () => {
-		const config = baseConfig();
-		expect(resolveAutoWorkModel("P1", config, { provider: "anthropic", id: "claude-ws" })).toEqual({
+	test("cascades to lower difficulty within workspace (hard→medium)", () => {
+		const config = baseConfig({
+			modelByDifficulty: {
+				...DEFAULT_MODEL_BY_DIFFICULTY,
+				medium: { provider: "anthropic", id: "claude-medium" },
+			},
+		});
+		expect(resolveAutoWorkModel("hard", config, noGlobal, null)).toEqual({
 			provider: "anthropic",
-			id: "claude-ws",
+			id: "claude-medium",
 		});
 	});
 
-	test("falls back to undefined (SDK global default) when neither is set", () => {
+	test("easy task does not cascade upward", () => {
+		const config = baseConfig({
+			modelByDifficulty: {
+				...DEFAULT_MODEL_BY_DIFFICULTY,
+				medium: { provider: "anthropic", id: "claude-medium" },
+				hard: { provider: "anthropic", id: "claude-hard" },
+			},
+		});
+		// easy has no mapping; hard/medium are above it — must not be used
+		expect(resolveAutoWorkModel("easy", config, noGlobal, { provider: "anthropic", id: "ws-default" })).toEqual({
+			provider: "anthropic",
+			id: "ws-default",
+		});
+	});
+
+	test("falls through to global mapping after exhausting workspace", () => {
 		const config = baseConfig();
-		expect(resolveAutoWorkModel("P2", config, null)).toBeUndefined();
+		const global: AutoWorkGlobalConfig = {
+			...noGlobal,
+			modelByDifficulty: {
+				...DEFAULT_MODEL_BY_DIFFICULTY,
+				medium: { provider: "openai", id: "gpt-global-medium" },
+			},
+		};
+		expect(resolveAutoWorkModel("hard", config, global, null)).toEqual({
+			provider: "openai",
+			id: "gpt-global-medium",
+		});
+	});
+
+	test("global cascade respects lower-difficulty-only direction", () => {
+		const config = baseConfig();
+		const global: AutoWorkGlobalConfig = {
+			...noGlobal,
+			modelByDifficulty: {
+				...DEFAULT_MODEL_BY_DIFFICULTY,
+				easy: { provider: "openai", id: "gpt-global-easy" },
+			},
+		};
+		// hard task cascades to medium then easy in global
+		expect(resolveAutoWorkModel("hard", config, global, null)).toEqual({
+			provider: "openai",
+			id: "gpt-global-easy",
+		});
+	});
+
+	test("falls back to workspace default model when all maps are null", () => {
+		expect(resolveAutoWorkModel("medium", baseConfig(), noGlobal, { provider: "anthropic", id: "ws-default" })).toEqual({
+			provider: "anthropic",
+			id: "ws-default",
+		});
+	});
+
+	test("returns undefined when all maps null and no workspace default", () => {
+		expect(resolveAutoWorkModel("easy", baseConfig(), noGlobal, null)).toBeUndefined();
 	});
 });
 
@@ -690,13 +794,20 @@ class FakeSessionHandle {
 		this.turnEnded = Promise.withResolvers<void>();
 	}
 
+	/** T-100: the engine releases failed sessions — count calls so tests can assert cleanup. */
+	disposeCalls = 0;
+
+	async dispose(): Promise<void> {
+		this.disposeCalls += 1;
+	}
+
 	/** T-94: records the title `maybeAutoTitleSession` applies via the shared session-title helper. */
 	async setName(name: string): Promise<void> {
 		this.setNameCalls.push(name);
 	}
 
 	/** Minimal snapshot stand-in — enough for `latestAssistantText` to read the configured response and for usage capture. */
-	async snapshot(): Promise<{ messages: Array<{ role: string; content: unknown }>; usageRollup?: typeof this.usageRollup }> {
+	async snapshot(): Promise<{ messages: Array<{ role: string; content: unknown }>; usageRollup?: FakeSessionHandle["usageRollup"] }> {
 		return { messages: [{ role: "assistant", content: this.assistantResponse }], usageRollup: this.usageRollup };
 	}
 }
@@ -804,6 +915,21 @@ describe("waitForAutoWorkSessionTerminal", () => {
 		const terminal = waitForAutoWorkSessionTerminal(handle as unknown as SessionHandle, 60_000, () => handle.prompt("go"));
 
 		handle.emit({ type: "turn_end", message: { stopReason } });
+		handle.emit({ type: "turn_end", message: { stopReason: "end_turn" } });
+
+		expect(await terminal).toBe("completed");
+	});
+
+	test("ignores TTSR advisories until the turn ends successfully", async () => {
+		const handle = new FakeSessionHandle("sess_ttsr_advisory", null);
+		const terminal = waitForAutoWorkSessionTerminal(handle as unknown as SessionHandle, 60_000, () => handle.prompt("go"));
+
+		handle.emit({ type: "notice", level: "error", message: "TTSR matched rules: tool policy" });
+		handle.emit({
+			type: "turn_end",
+			message: { stopReason: "aborted", errorMessage: "TTSR matched rules: tool policy" },
+		});
+		handle.emit({ type: "ttsr_triggered", rules: [{ name: "tool policy" }] });
 		handle.emit({ type: "turn_end", message: { stopReason: "end_turn" } });
 
 		expect(await terminal).toBe("completed");
@@ -1254,8 +1380,8 @@ describe("appendAgentHistoryEntry", () => {
 // Stubs `gh pr create` for every `runAutoWorkCycle` test that reaches the
 // success path (T-66) — a test must NEVER let the real default run, since
 // that would shell out to `gh` and attempt to open an actual GitHub PR.
-async function stubCreatePullRequest(): Promise<{ url: string; number: number }> {
-	return { url: "https://github.com/jaesbit/omp-deck/pull/321", number: 321 };
+async function stubCreatePullRequest(): Promise<{ url: string; number: number; prStatus: "opened" | "already_open" }> {
+	return { url: "https://github.com/jaesbit/omp-deck/pull/321", number: 321, prStatus: "opened" };
 }
 
 let dbDir: string;
@@ -1440,6 +1566,14 @@ function fakeGhFailure(stderrText: string, exitCode = 1): FakeGhSubprocess {
 	};
 }
 
+function fakeGhSuccess(stdoutText: string): FakeGhSubprocess {
+	return {
+		stdout: new Blob([stdoutText]).stream(),
+		stderr: new Blob([""]).stream(),
+		exited: Promise.resolve(0),
+	};
+}
+
 
 function withFakeGhSpawn(handler: (cmd: string[]) => FakeGhSubprocess): () => void {
 	const realSpawn = Bun.spawn;
@@ -1525,15 +1659,104 @@ describe("createPullRequestViaGh", () => {
 			}
 			return fakeGhFailure(`unexpected PR base ${cmd[baseIndex + 1]}`);
 		});
+		// The diff guard needs `origin/devel` fetched locally to diff against —
+		// mirror how a real worktree is always created FROM `origin/<base>`
+		// (so the ref necessarily exists by the time PR creation runs).
+		runGit(["push", "origin", "HEAD:devel"], repoCwd);
+		runGit(["fetch", "-q", "origin", "devel"], repoCwd);
 		try {
 			const result = await withProjectBasePolicy("devel", () =>
 				createPullRequestViaGh({ cwd: repoCwd, title: "Policy branch", body: "Uses the configured branch." }),
 			);
 
-			expect(result).toEqual({ url: "https://github.com/jaesbit/omp-deck/pull/808", number: 808 });
+			expect(result).toEqual({ url: "https://github.com/jaesbit/omp-deck/pull/808", number: 808, prStatus: "opened" });
 		} finally {
 			restore();
 		}
+	});
+
+	test("returns the existing PR with prStatus 'already_open' when gh pr create reports the PR already exists (case-insensitive)", async () => {
+		const restore = withFakeGhSpawn((cmd) => {
+			if (cmd[2] === "create") {
+				// Simulate the gh output when the agent already opened a PR.
+				// Use uppercase "A pull request" to exercise the case-insensitive check.
+				return fakeGhFailure("A pull request for branch 'auto-work/t5-ship-it' already exists: https://github.com/jaesbit/omp-deck/pull/77");
+			}
+			// gh pr view --json number,url — recovery lookup
+			return fakeGhSuccess('{"number":77,"url":"https://github.com/jaesbit/omp-deck/pull/77"}');
+		});
+		try {
+			const result = await createPullRequestViaGh({ cwd: repoCwd, title: "T", body: "B" });
+			expect(result).toEqual({ url: "https://github.com/jaesbit/omp-deck/pull/77", number: 77, prStatus: "already_open" });
+		} finally {
+			restore();
+		}
+	});
+
+	// ─── T-119: sensitive-content guard ────────────────────────────────────
+
+	test("rejects and never calls gh when the PR title contains an absolute URL", async () => {
+		let ghCalled = false;
+		const restore = withFakeGhSpawn(() => {
+			ghCalled = true;
+			return fakeGhSuccess("https://github.com/jaesbit/omp-deck/pull/1\n");
+		});
+		try {
+			await expect(
+				createPullRequestViaGh({ cwd: repoCwd, title: `feat: T-1 see ${"http" + "://localhost:8787/c/abc"}`, body: "B" }),
+			).rejects.toThrow(SensitiveContentError);
+		} finally {
+			restore();
+		}
+		expect(ghCalled).toBe(false);
+	});
+
+	test("rejects and never calls gh when the PR body embeds credentials in a URL", async () => {
+		let ghCalled = false;
+		const restore = withFakeGhSpawn(() => {
+			ghCalled = true;
+			return fakeGhSuccess("https://github.com/jaesbit/omp-deck/pull/1\n");
+		});
+		// String-concatenated so this test file's own source diff never
+		// contains a contiguous credential-shaped match (see pr-content-guard.ts).
+		const sneaky = ["https://user", "s3cr3t@example.com/callback"].join(":");
+		try {
+			await expect(createPullRequestViaGh({ cwd: repoCwd, title: "T", body: `Auto Work — ${sneaky}` })).rejects.toThrow(
+				SensitiveContentError,
+			);
+		} finally {
+			restore();
+		}
+		expect(ghCalled).toBe(false);
+	});
+
+	test("rejects a branch whose diff adds a realistic-looking secret, and never pushes or calls gh", async () => {
+		const fakeKey = ["sk-ant", `api03-${"A".repeat(60)}`].join("-");
+		fs.writeFileSync(path.join(repoCwd, "leaked.txt"), `${fakeKey}\n`);
+		runGit(["add", "."], repoCwd);
+		runGit(["commit", "-q", "-m", "oops"], repoCwd);
+
+		const originDir = path.join(homeDir, "origin.git");
+		const shaBefore = Bun.spawnSync({ cmd: ["git", "rev-parse", "refs/heads/main"], cwd: originDir, stdout: "pipe" }).stdout
+			.toString()
+			.trim();
+
+		let ghCalled = false;
+		const restore = withFakeGhSpawn(() => {
+			ghCalled = true;
+			return fakeGhSuccess("https://github.com/jaesbit/omp-deck/pull/1\n");
+		});
+		try {
+			await expect(createPullRequestViaGh({ cwd: repoCwd, title: "T", body: "B" })).rejects.toThrow(SensitiveContentError);
+		} finally {
+			restore();
+		}
+		expect(ghCalled).toBe(false);
+
+		const shaAfter = Bun.spawnSync({ cmd: ["git", "rev-parse", "refs/heads/main"], cwd: originDir, stdout: "pipe" }).stdout
+			.toString()
+			.trim();
+		expect(shaAfter).toBe(shaBefore); // never pushed — the secret never reached origin
 	});
 
 	test("pushes the unpushed task branch to origin before gh pr create", async () => {
@@ -1563,30 +1786,8 @@ describe("createPullRequestViaGh", () => {
 		expect(lsRemote.stdout.toString()).toContain("auto-work/t1-demo");
 	});
 
-	test("recovers the agent-created PR when gh pr create reports it already exists", async () => {
-		const restore = withFakeGhSpawn((cmd) => {
-			if (cmd[1] === "pr" && cmd[2] === "create") {
-				return fakeGhFailure(
-					'a pull request for branch "auto-work/t3-x" into branch "main" already exists:\nhttps://github.com/o/r/pull/3',
-				);
-			}
-			if (cmd[1] === "pr" && cmd[2] === "view") {
-				return {
-					stdout: new Blob(['{"number":3,"url":"https://github.com/o/r/pull/3"}']).stream(),
-					stderr: new Blob([""]).stream(),
-					exited: Promise.resolve(0),
-				};
-			}
-			return fakeGhFailure(`unexpected gh command: ${cmd.join(" ")}`);
-		});
-		try {
-			const result = await createPullRequestViaGh({ cwd: repoCwd, title: "T", body: "B" });
-			expect(result).toEqual({ url: "https://github.com/o/r/pull/3", number: 3 });
-		} finally {
-			restore();
-		}
-	});
 });
+
 
 describe("runAutoWorkCycle", () => {
 	test("selects the task, creates a worktree, starts a session, and closes the run as completed", async () => {
@@ -1606,6 +1807,8 @@ describe("runAutoWorkCycle", () => {
 		expect(result.sessionId).toBe("sess_1");
 		expect(fs.existsSync(result.worktreePath)).toBe(true);
 		expect(result.worktreePath).toContain(`aw-T${task.displayId}`);
+		expect(result.prNumber).toBe(321);
+		expect(result.prStatus).toBe("opened");
 
 		const updated = getTask(task.id);
 		expect(updated?.stateId).toBe("s_validate");
@@ -1620,6 +1823,23 @@ describe("runAutoWorkCycle", () => {
 		expect(runs[0]?.status).toBe("completed");
 		expect(runs[0]?.sessionId).toBe("sess_1");
 		expect(runs[0]?.worktreePath).toBe(result.worktreePath);
+	});
+
+	test("moves a completed task to blocked with a visible reason when validate state is missing", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const task = createTask({ title: "Needs manual validation routing", cwd: repoCwd, priority: "P5", autoWork: true });
+		getDb().prepare("DELETE FROM task_states WHERE id = ?").run("s_validate");
+
+		const result = await runAutoWorkCycle(repoCwd, fakeBridge(new FakeSessionHandle("sess_missing_validate", 10)), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+			createPullRequest: stubCreatePullRequest,
+		});
+
+		expect(result.outcome).toBe("completed");
+		expect(getTask(task.id)?.stateId).toBe("s_blocked");
+		expect(getTask(task.id)?.body).toContain('validate task state not found, task moved to blocked for manual review');
+		const run = listAutoWorkRuns({ taskId: task.id })[0];
+		expect(run).toEqual(expect.objectContaining({ status: "completed", failureReason: expect.stringContaining("validate task state not found") }));
 	});
 
 	test("autoMerge arms GitHub auto-merge and parks the run as completed_pending_merge", async () => {
@@ -1740,22 +1960,63 @@ describe("runAutoWorkCycle", () => {
         }
     });
 
-	test("records an aborted agent turn as failed instead of completed", async () => {
-		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
-		const task = createTask({ title: "Agent cancellation", cwd: repoCwd, priority: "P5", autoWork: true });
-		const handle = new FakeSessionHandle("sess_aborted", null);
-		const cycle = runAutoWorkCycle(repoCwd, fakeBridge(handle), {
-			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
-			createPullRequest: async () => {
-				throw new Error("an aborted run must not create a pull request");
-			},
-		});
-		await handle.subscriptionStarted;
-		handle.emit({ type: "turn_end", message: { stopReason: "aborted" } });
-		const result = await cycle;
+	/** Yields microtasks until `handle.prompts` reaches `count`, then returns.
+	 *  Throws after 50 iterations so a regression produces a clear error rather
+	 *  than an infinite hang. */
+	async function waitForPromptCount(handle: FakeSessionHandle, count: number): Promise<void> {
+		for (let i = 0; i < 50; i++) {
+			if (handle.prompts.length >= count) return;
+			await Promise.resolve();
+		}
+		throw new Error(
+			`waitForPromptCount: expected ${count} prompt(s) but got ${handle.prompts.length} after 50 microtask yields`,
+		);
+	}
 
-		expect(result.outcome).not.toBe("completed");
-		expect(listAutoWorkRuns({ taskId: task.id })[0]?.status).toBe("failed");
+	describe("same-run abort retry", () => {
+		test("first aborted → continuation prompt sent → end_turn on retry → run completes", async () => {
+			setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+			const task = createTask({ title: "Retry succeeds", cwd: repoCwd, priority: "P5", autoWork: true });
+			const handle = new FakeSessionHandle("sess_abort_retry_ok", null);
+			const cycle = runAutoWorkCycle(repoCwd, fakeBridge(handle), {
+				getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+				createPullRequest: stubCreatePullRequest,
+			});
+			await handle.subscriptionStarted;
+			handle.emit({ type: "turn_end", message: { stopReason: "aborted" } });
+			// Wait until the engine's retry loop has enqueued the continuation prompt.
+			await waitForPromptCount(handle, 2);
+			// Continuation turn completes successfully.
+			handle.emit({ type: "turn_end", message: { stopReason: "end_turn" } });
+			const result = await cycle;
+
+			expect(result.outcome).toBe("completed");
+			expect(handle.prompts.length).toBe(2); // initial + continuation
+			const run = listAutoWorkRuns({ taskId: task.id })[0];
+			expect(run?.status).toBe("completed");
+		});
+
+		test("two consecutive aborts exhaust retry budget: run fails and task routes to backlog", async () => {
+			setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+			const task = createTask({ title: "Retry exhausted", cwd: repoCwd, priority: "P5", autoWork: true });
+			const handle = new FakeSessionHandle("sess_abort_retry_fail", null);
+			const cycle = runAutoWorkCycle(repoCwd, fakeBridge(handle), {
+				getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+				createPullRequest: async () => { throw new Error("no PR on failed run"); },
+			});
+			await handle.subscriptionStarted;
+			handle.emit({ type: "turn_end", message: { stopReason: "aborted" } });
+			await waitForPromptCount(handle, 2);
+			handle.emit({ type: "turn_end", message: { stopReason: "aborted" } });
+			const result = await cycle;
+
+			expect(result.outcome).toBe("failed");
+			expect(handle.prompts.length).toBe(2); // initial + one retry
+			const run = listAutoWorkRuns({ taskId: task.id })[0];
+			expect(run?.status).toBe("failed");
+			// Task returns to backlog (retry budget not yet exhausted at the cross-cycle level).
+			expect(getTask(task.id)?.stateId).toBe("s_backlog");
+		});
 	});
 
 	test("fails a max_tokens terminal turn, preserving its stop reason without creating a PR", async () => {
@@ -1897,6 +2158,7 @@ describe("runAutoWorkCycle", () => {
 		// The still-running session must actually be stopped when the run is
 		// written off — otherwise the agent keeps working past the timeout.
 		expect(handle.abortCalls).toBe(1);
+		expect(handle.disposeCalls).toBeGreaterThanOrEqual(1);
 	});
 
 	test("on PR creation failure, still moves the completed task to validate with a fallback note (T-66)", async () => {
@@ -1927,6 +2189,25 @@ describe("runAutoWorkCycle", () => {
 		const runs = listAutoWorkRuns({ taskId: task.id });
 		expect(runs[0]?.status).toBe("completed_pr_failed");
 		expect(runs[0]?.failureReason).toBe("gh pr create failed (exit 1): no git remotes found");
+		expect(result.prStatus).toBe("failed");
+		expect(result.prFailureReason).toBe("gh pr create failed (exit 1): no git remotes found");
+	});
+
+	test("completed result carries prStatus 'already_open' when createPullRequest reports an existing PR", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const task = createTask({ title: "Agent pre-opened PR", cwd: repoCwd, priority: "P5", autoWork: true });
+		const handle = new FakeSessionHandle("sess_pr_existing", 10);
+		const result = await runAutoWorkCycle(repoCwd, fakeBridge(handle), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+			createPullRequest: async () => ({ url: "https://github.com/jaesbit/omp-deck/pull/42", number: 42, prStatus: "already_open" as const }),
+		});
+		expect(result.outcome).toBe("completed");
+		if (result.outcome !== "completed") throw new Error("expected completed");
+		expect(result.prNumber).toBe(42);
+		expect(result.prStatus).toBe("already_open");
+		expect(result.prFailureReason).toBeUndefined();
+		expect(getTask(task.id)?.stateId).toBe("s_validate");
+		expect(getTask(task.id)?.body).toContain("PR #42");
 	});
 
 	test("records the completed_pr_failed run's failureReason and the fallback-note body when gh pr create fails with a non-no-commits error (T-85)", async () => {
@@ -2206,6 +2487,30 @@ describe("runAutoWorkCycle", () => {
 		expect(fs.existsSync(worktreePath)).toBe(true);
 	});
 
+	test("strips a repo-local git identity override so commits fall back to the global config", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const task = createTask({ title: "Identity leak guard", cwd: repoCwd, priority: "P5", autoWork: true });
+
+		// Simulate the exact poisoned state found in production: a repo-local
+		// override shared by every worktree (extensions.worktreeConfig is not
+		// enabled), masking the real committer identity.
+		runGit(["config", "--local", "user.name", "agent"], repoCwd);
+		runGit(["config", "--local", "user.email", "agent@omp-deck.local"], repoCwd);
+
+		const handle = new FakeSessionHandle("sess_identity_guard", 10);
+		const result = await runAutoWorkCycle(repoCwd, fakeBridge(handle), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+			createPullRequest: stubCreatePullRequest,
+		});
+
+		expect(result.outcome).toBe("completed");
+
+		const nameCheck = Bun.spawnSync({ cmd: ["git", "config", "--local", "--get", "user.name"], cwd: repoCwd });
+		const emailCheck = Bun.spawnSync({ cmd: ["git", "config", "--local", "--get", "user.email"], cwd: repoCwd });
+		expect(nameCheck.exitCode).not.toBe(0);
+		expect(emailCheck.exitCode).not.toBe(0);
+	});
+
 	test("uses the injected generateBranchSlug for the worktree/branch name, without an extra bridge.createSession call for it", async () => {
 		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
 		const task = createTask({ title: "Arreglar el login roto", cwd: repoCwd, priority: "P5", autoWork: true });
@@ -2265,7 +2570,7 @@ describe("runAutoWorkCycle", () => {
 			createPullRequest: async () => { throw new Error("should not be called"); },
 		});
 		await handle.subscriptionStarted;
-		handle.emit({ type: "turn_end", message: { stopReason: "aborted" } });
+		handle.emit({ type: "turn_end", message: { stopReason: "error" } });
 		const result = await cycle;
 
 		expect(result.outcome).toBe("failed");
@@ -2522,6 +2827,192 @@ describe("runGlobalAutoWorkCycle", () => {
 		expect(createSessionCalls[2]).toMatchObject({ cwd: repoCwd });
 		expect(createSessionCalls[2]?.systemPromptAppend).toEqual(expect.any(String));
 	});
+	test("pinnedTaskId makes the inner cycle run exactly the global winner, not its own priority pick", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const priorityPick = createTask({ title: "P0 would win", cwd: repoCwd, priority: "P0", autoWork: true });
+		const pinnedWinner = createTask({ title: "Pinned P5", cwd: repoCwd, priority: "P5", autoWork: true });
+
+		const result = await runAutoWorkCycle(repoCwd, fakeBridge(new FakeSessionHandle("pinned-run", 10)), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+			createPullRequest: stubCreatePullRequest,
+			generateBranchSlug: async () => "pinned-p5",
+			pinnedTaskId: pinnedWinner.id,
+		});
+
+		expect(result.outcome).toBe("completed");
+		if (result.outcome !== "completed") throw new Error("expected completed");
+		expect(result.taskId).toBe(pinnedWinner.id);
+		expect(getTask(priorityPick.id)?.stateId).toBe("s_backlog");
+	});
+
+	test("pinnedTaskId that is no longer eligible skips the cycle instead of running another task", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const fallback = createTask({ title: "Would-be fallback", cwd: repoCwd, priority: "P0", autoWork: true });
+		const gone = createTask({ title: "Moved away", cwd: repoCwd, priority: "P5", autoWork: true });
+		moveTask(gone.id, "s_active", 0);
+
+		const result = await runAutoWorkCycle(repoCwd, fakeBridge(new FakeSessionHandle("pinned-gone", 10)), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+			pinnedTaskId: gone.id,
+		});
+
+		expect(result.outcome).toBe("skipped");
+		if (result.outcome !== "skipped") throw new Error("expected skipped");
+		expect(result.reason).toContain("no longer eligible");
+		expect(getTask(fallback.id)?.stateId).toBe("s_backlog");
+	});
+
+	test("skip reason names each enabled workspace's blocker instead of a generic line", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		// An autoWork task with a cwd keeps the workspace inside the global
+		// scan while its done state leaves the backlog empty.
+		const doneTask = createTask({ title: "Already done", cwd: repoCwd, priority: "P5", autoWork: true });
+		moveTask(doneTask.id, "s_done", 0);
+
+		const result = await runGlobalAutoWorkCycle(fakeBridge(new FakeSessionHandle("unused", 10)), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+		});
+
+		expect(result.outcome).toBe("skipped");
+		if (result.outcome !== "skipped") throw new Error("expected skipped");
+		expect(result.reason).toContain(repoCwd);
+		expect(result.reason).toContain("no eligible auto-work tasks in backlog");
+	});
+
+	test("names orphaned cwd-less auto-work tasks in the skip reason", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const doneTask = createTask({ title: "Keeps workspace enabled", cwd: repoCwd, priority: "P5", autoWork: true });
+		moveTask(doneTask.id, "s_done", 0);
+		const orphan = createTask({ title: "No workspace", priority: "P0", autoWork: true });
+
+		const result = await runGlobalAutoWorkCycle(fakeBridge(new FakeSessionHandle("unused", 10)), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+		});
+
+		expect(result.outcome).toBe("skipped");
+		if (result.outcome !== "skipped") throw new Error("expected skipped");
+		expect(result.reason).toContain(`T-${orphan.displayId}`);
+		expect(result.reason).toContain("no workspace (cwd)");
+	});
+
+	test("reports orphaned tasks even when no workspace is enabled at all", async () => {
+		const orphan = createTask({ title: "Orphan only", priority: "P0", autoWork: true });
+
+		const result = await runGlobalAutoWorkCycle(fakeBridge(new FakeSessionHandle("unused", 10)), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+		});
+
+		expect(result.outcome).toBe("skipped");
+		if (result.outcome !== "skipped") throw new Error("expected skipped");
+		expect(result.reason).toContain("no workspace has auto-work enabled");
+		expect(result.reason).toContain(`T-${orphan.displayId}`);
+	});
+});
+
+describe("runGlobalAutoWorkCycle orphan recovery (T-106)", () => {
+	function persistedSummary(sessionId: string, cwd: string): SessionSummary {
+		const now = new Date().toISOString();
+		return { id: sessionId, path: `/tmp/sessions/${sessionId}.jsonl`, cwd, createdAt: now, updatedAt: now, messageCount: 4 };
+	}
+
+	test("a running row orphaned by a restart, with a resumable session, is resumed through the owning workspace instead of blocking the global cycle", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const orphanTask = createTask({ title: "Orphaned by restart", cwd: repoCwd, priority: "P5", autoWork: true });
+		moveTask(orphanTask.id, "s_active", 0);
+		const worktreePath = path.join(repoCwd, ".worktrees", "aw-orphan-resume");
+		fs.mkdirSync(worktreePath, { recursive: true });
+		const orphanRunId = startAutoWorkRun({ taskId: orphanTask.id, taskPriority: "P5", sessionId: "sess_orphan_resume", worktreePath });
+
+		// A second, unrelated task sits ready in backlog — proves the tick that
+		// recovers the orphan does not also start a fresh task.
+		const otherTask = createTask({ title: "Would run next tick", cwd: repoCwd, priority: "P0", autoWork: true });
+
+		const resumedHandle = new FakeSessionHandle("sess_orphan_resume", 10);
+		const decoyHandle = new FakeSessionHandle("sess_decoy", 10);
+		const createSessionCalls: CreateSessionOpts[] = [];
+		const result = await runGlobalAutoWorkCycle(
+			fakeBridge(decoyHandle, {
+				createSessionCalls,
+				persistedSessions: [persistedSummary("sess_orphan_resume", worktreePath)],
+				liveSessions: new Map([["sess_orphan_resume", resumedHandle]]),
+			}),
+			{ getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }), createPullRequest: stubCreatePullRequest },
+		);
+
+		expect(result.outcome).toBe("completed");
+		if (result.outcome !== "completed") throw new Error("expected completed");
+		expect(result.taskId).toBe(orphanTask.id);
+		expect(result.runId).toBe(orphanRunId);
+		expect(result.sessionId).toBe("sess_orphan_resume");
+		expect(result.worktreePath).toBe(worktreePath);
+		expect(createSessionCalls).toHaveLength(0); // resumed — no fresh session created
+		expect(listAutoWorkRuns({ taskId: orphanTask.id })).toHaveLength(1); // no duplicate row
+		expect(getTask(orphanTask.id)?.stateId).toBe("s_validate");
+		expect(getTask(otherTask.id)?.stateId).toBe("s_backlog"); // untouched this tick
+	});
+
+	test("a running row orphaned by a restart, with no persisted session, is retired and the same tick selects another task", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const orphanTask = createTask({ title: "Orphaned, unrecoverable", cwd: repoCwd, priority: "P5", autoWork: true });
+		moveTask(orphanTask.id, "s_active", 0);
+		const worktreePath = path.join(repoCwd, ".worktrees", "aw-orphan-stale");
+		runGit(["worktree", "add", "-b", "auto-work/orphan-stale-test", worktreePath], repoCwd);
+		expect(fs.existsSync(worktreePath)).toBe(true);
+		const orphanRunId = startAutoWorkRun({ taskId: orphanTask.id, taskPriority: "P5", sessionId: "sess_orphan_stale", worktreePath });
+
+		// Higher priority than the retired task once it's back in backlog —
+		// must win the re-selection, proving the cycle picks up fresh work
+		// rather than merely retrying the task it just retired.
+		const nextTask = createTask({ title: "Picked up same tick", cwd: repoCwd, priority: "P0", autoWork: true });
+
+		const freshHandle = new FakeSessionHandle("sess_fresh_after_retire", 10);
+		const result = await runGlobalAutoWorkCycle(
+			fakeBridge(freshHandle), // no persistedSessions/liveSessions registered for sess_orphan_stale -> stale
+			{ getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }), createPullRequest: stubCreatePullRequest },
+		);
+
+		const orphanRun = listAutoWorkRuns({ taskId: orphanTask.id }).find((r) => r.id === orphanRunId);
+		expect(orphanRun?.status).toBe("failed");
+		expect(orphanRun?.failureReason).toBe("session_lost");
+		expect(getTask(orphanTask.id)?.stateId).toBe("s_backlog"); // first failure — auto-retry, not blocked
+		expect(fs.existsSync(worktreePath)).toBe(false); // orphaned worktree was removed by the retire path
+
+		expect(result.outcome).toBe("completed");
+		if (result.outcome !== "completed") throw new Error("expected completed");
+		expect(result.taskId).toBe(nextTask.id); // the cycle continued and picked the fresh candidate
+		expect(result.sessionId).toBe("sess_fresh_after_retire");
+	});
+
+	test("a genuinely live run (this process's own finalizer) keeps the global mutex skip, unlike a restart orphan", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const liveTask = createTask({ title: "Genuinely in flight", cwd: repoCwd, priority: "P5", autoWork: true });
+
+		// Never emits a terminal event on its own — stays "running" in this
+		// same process until explicitly triggered below via `emit()`.
+		const liveHandle = new FakeSessionHandle("sess_live_mutex", null);
+		const cycle = runGlobalAutoWorkCycle(fakeBridge(liveHandle), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+			createPullRequest: stubCreatePullRequest,
+			selectTask: async (candidates) => candidates[0]?.task.id,
+			generateBranchSlug: async () => "live-mutex",
+		});
+		// Waits until the real execution turn subscribes — by then
+		// `finalizeAutoWorkRun` has already registered the run in `activeRunIds`.
+		await liveHandle.subscriptionStarted;
+
+		const otherTask = createTask({ title: "Must wait its turn", cwd: repoCwd, priority: "P0", autoWork: true });
+		const secondTick = await runGlobalAutoWorkCycle(fakeBridge(new FakeSessionHandle("sess_unused", 10)), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+		});
+		expect(secondTick).toEqual({ outcome: "skipped", reason: "another auto-work run is already active" });
+		expect(getTask(otherTask.id)?.stateId).toBe("s_backlog");
+
+		liveHandle.emit({ type: "turn_end", message: { stopReason: "end_turn" } });
+		const result = await cycle;
+		expect(result.outcome).toBe("completed");
+		if (result.outcome !== "completed") throw new Error("expected completed");
+		expect(result.taskId).toBe(liveTask.id);
+	});
 });
 
 describe("runAutoWorkCycle session continuation (T-65)", () => {
@@ -2671,7 +3162,7 @@ describe("runAutoWorkCycle session continuation (T-65)", () => {
 		expect(fs.existsSync(worktreePath)).toBe(false);
 	});
 
-	test("does not treat a stale run as a mutex block — a fresh eligible task is picked up in the same cycle", async () => {
+	test("does not treat a stale run as a mutex block — the retired task returns to backlog and is re-selected in the same cycle", async () => {
 		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
 		const staleTask = createTask({ title: "Was active, now orphaned", cwd: repoCwd, priority: "P1", autoWork: true });
 		moveTask(staleTask.id, "s_active", 0);
@@ -2684,6 +3175,7 @@ describe("runAutoWorkCycle session continuation (T-65)", () => {
 			worktreePath,
 		});
 
+		// Lower priority than the stale task — must lose the re-selection.
 		const freshTask = createTask({ title: "Fresh backlog task", cwd: repoCwd, priority: "P5", autoWork: true });
 
 		const handle = new FakeSessionHandle("sess_new", 10);
@@ -2692,13 +3184,20 @@ describe("runAutoWorkCycle session continuation (T-65)", () => {
 			createPullRequest: stubCreatePullRequest,
 		});
 
+		// The stale row is retired, its task re-routed to backlog, and — since
+		// the snapshot is refreshed — that same task (P1 beats the fresh P5)
+		// is retried immediately with a fresh session in the same cycle.
 		expect(result.outcome).toBe("completed");
 		if (result.outcome !== "completed") throw new Error("expected completed");
-		expect(result.taskId).toBe(freshTask.id);
+		expect(result.taskId).toBe(staleTask.id);
 		expect(result.sessionId).toBe("sess_new");
 
-		expect(getTask(staleTask.id)?.stateId).toBe("s_backlog");
+		expect(getTask(staleTask.id)?.stateId).toBe("s_validate");
+		expect(getTask(freshTask.id)?.stateId).toBe("s_backlog");
+		// The orphaned worktree was removed by the retire path — the retry ran
+		// in a newly created worktree, never the stale one.
 		expect(fs.existsSync(worktreePath)).toBe(false);
+		expect(result.worktreePath).not.toBe(worktreePath);
 	});
 });
 
@@ -2881,6 +3380,23 @@ describe("runAutoWorkCycle token and pct recording (T-80)", () => {
 		expect(run?.pctConsumed).toBe(5); // 15 - 10
 	});
 
+	test("clamps pctConsumed to zero when the subscription week resets during a completed run", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		createTask({ title: "Subscription reset task", cwd: repoCwd, priority: "P5", autoWork: true });
+
+		let usageCallCount = 0;
+		const result = await runAutoWorkCycle(repoCwd, fakeBridge(new FakeSessionHandle("sess_pct_reset", 10)), {
+			getSubscriptionUsage: async () => {
+				usageCallCount++;
+				return { available: true, weeklyPct: usageCallCount === 1 ? 70 : 2 };
+			},
+			createPullRequest: stubCreatePullRequest,
+		});
+
+		expect(result.outcome).toBe("completed");
+		expect(listAutoWorkRuns({})[0]?.pctConsumed).toBe(0);
+	});
+
 	test("persists inputTokens, outputTokens, and pctConsumed even on a failed run", async () => {
 		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
 		const task = createTask({ title: "Failing token task", cwd: repoCwd, priority: "P5", autoWork: true });
@@ -2899,7 +3415,7 @@ describe("runAutoWorkCycle token and pct recording (T-80)", () => {
 			},
 		});
 		await handle.subscriptionStarted;
-		handle.emit({ type: "turn_end", message: { stopReason: "aborted" } });
+		handle.emit({ type: "turn_end", message: { stopReason: "error" } });
 		const result = await cycle;
 
 		expect(result.outcome).toBe("failed");
@@ -2953,6 +3469,327 @@ describe("runAutoWorkCycle token and pct recording (T-80)", () => {
 		expect(run?.outputTokens).toBeNull();
 		// pctConsumed is 0 because both start and end weeklyPct = 5 (same stub each call)
 		expect(run?.pctConsumed).toBe(0);
+	});
+});
+// ─── Retry budget and failed-session cleanup (T-100) ───────────────────────
+
+describe("runAutoWorkCycle retry budget and session cleanup (T-100)", () => {
+	let seedSeq = 0;
+
+	/**
+	 * Seeds a closed run for `taskId` — prior history feeding the
+	 * consecutive-failure streak. Each seed is backdated (minutes in the past,
+	 * in insertion order) so ordering is deterministic without wall-clock
+	 * sleeps: the cycle's own run always gets a strictly newer `started_at`
+	 * than any seed, and `countConsecutiveAutoWorkFailures` orders by it.
+	 */
+	function seedClosedRun(taskId: string, status: "completed" | "failed"): void {
+		seedSeq += 1;
+		const runId = startAutoWorkRun({
+			taskId,
+			taskPriority: "P5",
+			sessionId: `sess_seed_${seedSeq}`,
+			worktreePath: `/tmp/aw-seed-${seedSeq}`,
+		});
+		completeAutoWorkRun(runId, { status, failureReason: status === "failed" ? "seeded failure" : undefined });
+		const startedAt = new Date(Date.now() - 60_000 * (100 - seedSeq)).toISOString();
+		getDb().prepare("UPDATE auto_work_runs SET started_at = ? WHERE id = ?").run(startedAt, runId);
+	}
+
+	/** Runs one cycle whose agent turn ends with a failing stop reason (same pattern as the aborted/max_tokens tests). */
+	async function runFailingCycle(handle: FakeSessionHandle) {
+		const cycle = runAutoWorkCycle(repoCwd, fakeBridge(handle), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+			createPullRequest: async () => {
+				throw new Error("a failed run must not create a pull request");
+			},
+		});
+		await handle.subscriptionStarted;
+		handle.emit({ type: "turn_end", message: { stopReason: "error" } });
+		return cycle;
+	}
+
+	test("a failure with retry budget left returns the task to backlog with the remaining-attempts note and disposes the session", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const task = createTask({ title: "One prior failure", cwd: repoCwd, priority: "P5", autoWork: true });
+		seedClosedRun(task.id, "failed");
+
+		const handle = new FakeSessionHandle("sess_budget_left", null);
+		const result = await runFailingCycle(handle);
+
+		expect(result.outcome).toBe("failed");
+		const updated = getTask(task.id);
+		expect(updated?.stateId).toBe("s_backlog");
+		expect(updated?.body).toContain("1 automatic retry attempt(s) remaining");
+		expect(updated?.body).not.toContain("MAX_RETRIES_EXCEEDED");
+		expect(listAutoWorkRuns({ taskId: task.id })[0]?.status).toBe("failed");
+		// T-100: a written-off run must release its live session handle.
+		expect(handle.disposeCalls).toBeGreaterThanOrEqual(1);
+	});
+
+	test("the third consecutive failure exhausts the budget: task parks in blocked with a MAX_RETRIES_EXCEEDED note", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const task = createTask({ title: "Two prior failures", cwd: repoCwd, priority: "P5", autoWork: true });
+		seedClosedRun(task.id, "failed");
+		seedClosedRun(task.id, "failed");
+
+		const handle = new FakeSessionHandle("sess_budget_exhausted", null);
+		const result = await runFailingCycle(handle);
+
+		expect(result.outcome).toBe("failed");
+		const updated = getTask(task.id);
+		expect(updated?.stateId).toBe("s_blocked");
+		expect(updated?.body).toContain("MAX_RETRIES_EXCEEDED");
+		expect(updated?.body).not.toContain("automatic retry attempt(s) remaining");
+		expect(listAutoWorkRuns({ taskId: task.id })[0]?.status).toBe("failed");
+		expect(handle.disposeCalls).toBeGreaterThanOrEqual(1);
+	});
+
+	test("the next cycle selects another backlog task instead of re-running the exhausted one", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		// Created first, so if the exhausted task ever leaked back to backlog it
+		// would sit at order 0 and win selection — making this test fail loudly.
+		const exhausted = createTask({ title: "Exhausted task", cwd: repoCwd, priority: "P5", autoWork: true });
+		seedClosedRun(exhausted.id, "failed");
+		seedClosedRun(exhausted.id, "failed");
+		await runFailingCycle(new FakeSessionHandle("sess_exhausting_run", null));
+		expect(getTask(exhausted.id)?.stateId).toBe("s_blocked");
+		const exhaustedRunCount = listAutoWorkRuns({ taskId: exhausted.id }).length;
+
+		const other = createTask({ title: "Fresh backlog task", cwd: repoCwd, priority: "P5", autoWork: true });
+		const okHandle = new FakeSessionHandle("sess_other_task", 10);
+		const createSessionCalls: CreateSessionOpts[] = [];
+		const result = await runAutoWorkCycle(repoCwd, fakeBridge(okHandle, { createSessionCalls }), {
+			getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+			createPullRequest: stubCreatePullRequest,
+		});
+
+		expect(result.outcome).toBe("completed");
+		if (result.outcome !== "completed") throw new Error("expected completed");
+		expect(result.taskId).toBe(other.id);
+		// The exhausted task stays parked: still blocked, no new session, no new run row.
+		expect(getTask(exhausted.id)?.stateId).toBe("s_blocked");
+		expect(createSessionCalls).toHaveLength(1);
+		expect(listAutoWorkRuns({ taskId: exhausted.id })).toHaveLength(exhaustedRunCount);
+	});
+
+	test("a successful run resets the failure streak: the next failure returns to backlog instead of blocked", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const task = createTask({ title: "Streak reset by success", cwd: repoCwd, priority: "P5", autoWork: true });
+		seedClosedRun(task.id, "failed");
+		seedClosedRun(task.id, "failed");
+		seedClosedRun(task.id, "completed");
+
+		const handle = new FakeSessionHandle("sess_streak_reset", null);
+		const result = await runFailingCycle(handle);
+
+		expect(result.outcome).toBe("failed");
+		const updated = getTask(task.id);
+		expect(updated?.stateId).toBe("s_backlog");
+		expect(updated?.body).toContain("2 automatic retry attempt(s) remaining");
+		expect(updated?.body).not.toContain("MAX_RETRIES_EXCEEDED");
+	});
+});
+
+describe("runAutoWorkCycle retry resume and launch resilience (T-104/T-105)", () => {
+	/** Seeds a closed failed run whose session/worktree a retry may pick back up. */
+	function seedFailedRun(taskId: string, sessionId: string, worktreePath: string, failureReason = "agent turn ended (stopReason: error)"): string {
+		const runId = startAutoWorkRun({ taskId, taskPriority: "P5", sessionId, worktreePath });
+		completeAutoWorkRun(runId, { status: "failed", failureReason });
+		const startedAt = new Date(Date.now() - 60_000).toISOString();
+		getDb().prepare("UPDATE auto_work_runs SET started_at = ? WHERE id = ?").run(startedAt, runId);
+		return runId;
+	}
+
+	function persistedSummary(sessionId: string, cwd: string): SessionSummary {
+		const now = new Date().toISOString();
+		return {
+			id: sessionId,
+			path: `/tmp/sessions/${sessionId}.jsonl`,
+			cwd,
+			createdAt: now,
+			updatedAt: now,
+			messageCount: 4,
+		};
+	}
+
+	test("a retry resumes the prior failed run's session in its worktree instead of creating a new session", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const task = createTask({ title: "Retry resumes context", cwd: repoCwd, priority: "P5", autoWork: true });
+		const worktreePath = path.join(repoCwd, ".worktrees", "aw-prior-attempt");
+		fs.mkdirSync(worktreePath, { recursive: true });
+		const priorRunId = seedFailedRun(task.id, "sess_prior", worktreePath);
+
+		const resumedHandle = new FakeSessionHandle("sess_prior", 10);
+		const decoyHandle = new FakeSessionHandle("sess_decoy", 10);
+		const createSessionCalls: CreateSessionOpts[] = [];
+		const result = await runAutoWorkCycle(
+			repoCwd,
+			fakeBridge(decoyHandle, {
+				createSessionCalls,
+				persistedSessions: [persistedSummary("sess_prior", worktreePath)],
+				liveSessions: new Map([["sess_prior", resumedHandle]]),
+			}),
+			{ getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }), createPullRequest: stubCreatePullRequest },
+		);
+
+		expect(result.outcome).toBe("completed");
+		if (result.outcome !== "completed") throw new Error("expected completed");
+		// Same session and worktree as the failed attempt — never a fresh session.
+		expect(result.sessionId).toBe("sess_prior");
+		expect(result.worktreePath).toBe(worktreePath);
+		expect(createSessionCalls).toHaveLength(0);
+		// The resumed session gets a continuation prompt naming the prior run
+		// and its failure, not the fresh first-turn prompt.
+		expect(resumedHandle.prompts).toHaveLength(1);
+		expect(resumedHandle.prompts[0]).toContain("Reintento");
+		expect(resumedHandle.prompts[0]).toContain(priorRunId);
+		expect(resumedHandle.prompts[0]).toContain(worktreePath);
+		expect(resumedHandle.prompts[0]).toContain("stopReason: error");
+		// The retry is its own run row, pointing at the resumed session.
+		const runs = listAutoWorkRuns({ taskId: task.id });
+		expect(runs).toHaveLength(2);
+		expect(runs[0]).toEqual(expect.objectContaining({ status: "completed", sessionId: "sess_prior", worktreePath }));
+	});
+
+	test("a retry whose prior worktree is gone starts a fresh session", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const task = createTask({ title: "Prior worktree removed", cwd: repoCwd, priority: "P5", autoWork: true });
+		seedFailedRun(task.id, "sess_gone_worktree", path.join(repoCwd, ".worktrees", "aw-deleted"));
+
+		const freshHandle = new FakeSessionHandle("sess_fresh_1", 10);
+		const createSessionCalls: CreateSessionOpts[] = [];
+		const result = await runAutoWorkCycle(
+			repoCwd,
+			fakeBridge(freshHandle, {
+				createSessionCalls,
+				persistedSessions: [persistedSummary("sess_gone_worktree", path.join(repoCwd, ".worktrees", "aw-deleted"))],
+				liveSessions: new Map([["sess_gone_worktree", new FakeSessionHandle("sess_gone_worktree", 10)]]),
+			}),
+			{ getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }), createPullRequest: stubCreatePullRequest },
+		);
+
+		expect(result.outcome).toBe("completed");
+		if (result.outcome !== "completed") throw new Error("expected completed");
+		expect(result.sessionId).toBe("sess_fresh_1");
+		expect(createSessionCalls).toHaveLength(1);
+		expect(freshHandle.prompts[0]).toContain("Trabaja en T-");
+	});
+
+	test("a retry whose prior session transcript is gone starts a fresh session", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const task = createTask({ title: "Prior session purged", cwd: repoCwd, priority: "P5", autoWork: true });
+		const worktreePath = path.join(repoCwd, ".worktrees", "aw-still-here");
+		fs.mkdirSync(worktreePath, { recursive: true });
+		seedFailedRun(task.id, "sess_purged", worktreePath);
+
+		const freshHandle = new FakeSessionHandle("sess_fresh_2", 10);
+		const createSessionCalls: CreateSessionOpts[] = [];
+		const result = await runAutoWorkCycle(
+			repoCwd,
+			fakeBridge(freshHandle, { createSessionCalls }),
+			{ getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }), createPullRequest: stubCreatePullRequest },
+		);
+
+		expect(result.outcome).toBe("completed");
+		if (result.outcome !== "completed") throw new Error("expected completed");
+		expect(result.sessionId).toBe("sess_fresh_2");
+		expect(createSessionCalls).toHaveLength(1);
+		expect(getTask(task.id)?.stateId).toBe("s_validate");
+	});
+
+	test("a session that fails to launch parks the task in blocked instead of aborting the cycle (T-105)", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const task = createTask({ title: "Launch failure", cwd: repoCwd, priority: "P5", autoWork: true });
+		const events: AutoWorkNotificationEvent[] = [];
+
+		const result = await runAutoWorkCycle(
+			repoCwd,
+			fakeBridge(new FakeSessionHandle("sess_never_used", 10), {
+				createSessionError: new Error("spawn agent-worker ENOENT\nstack trace noise"),
+			}),
+			{
+				getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }),
+				notify: async (event) => {
+					events.push(event);
+				},
+				createPullRequest: async () => {
+					throw new Error("a failed launch must not create a pull request");
+				},
+			},
+		);
+
+		expect(result.outcome).toBe("skipped");
+		if (result.outcome !== "skipped") throw new Error("expected skipped");
+		expect(result.reason).toContain("agent session launch failed: spawn agent-worker ENOENT");
+		const updated = getTask(task.id);
+		expect(updated?.stateId).toBe("s_blocked");
+		expect(updated?.body).toContain("**Auto Work launch failed**");
+		// No run row exists — the session never started, so there is nothing to settle.
+		expect(listAutoWorkRuns({ taskId: task.id })).toHaveLength(0);
+		expect(events).toEqual([
+			{ kind: "task_failed", displayId: task.displayId, reason: expect.stringContaining("agent session launch failed") },
+		]);
+	});
+
+	test("a resume failure on a running row closes the run and the cycle continues instead of wedging the mutex (T-105)", async () => {
+		setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+		const task = createTask({ title: "Wedged running row", cwd: repoCwd, priority: "P5", autoWork: true });
+		moveTask(task.id, "s_active", 0);
+		const worktreePath = path.join(repoCwd, ".worktrees", "aw-wedged");
+		fs.mkdirSync(worktreePath, { recursive: true });
+		const wedgedRunId = startAutoWorkRun({ taskId: task.id, taskPriority: "P5", sessionId: "sess_wedged", worktreePath });
+
+		// The persisted summary exists but resuming it throws (fakeBridge has no
+		// live handle registered for it) — the corrupt-transcript case.
+		const freshHandle = new FakeSessionHandle("sess_recovered", 10);
+		const createSessionCalls: CreateSessionOpts[] = [];
+		const result = await runAutoWorkCycle(
+			repoCwd,
+			fakeBridge(freshHandle, {
+				createSessionCalls,
+				persistedSessions: [persistedSummary("sess_wedged", worktreePath)],
+			}),
+			{ getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }), createPullRequest: stubCreatePullRequest },
+		);
+
+		// The wedged run is closed as failed with the resume error preserved…
+		const wedgedRun = listAutoWorkRuns({ taskId: task.id }).find((r) => r.id === wedgedRunId);
+		expect(wedgedRun?.status).toBe("failed");
+		expect(wedgedRun?.failureReason).toContain("session_resume_failed:");
+		// …and the same cycle moves on: the task returns to backlog, is
+		// re-selected, and (the retry resume also failing) runs fresh to completion.
+		expect(result.outcome).toBe("completed");
+		if (result.outcome !== "completed") throw new Error("expected completed");
+		expect(result.taskId).toBe(task.id);
+		expect(result.sessionId).toBe("sess_recovered");
+		expect(createSessionCalls).toHaveLength(1);
+	});
+
+	test("a broken KB root still launches the session with the bundled auto-work prompt (T-105)", async () => {
+		const savedKbRoot = process.env.OMP_DECK_KB_ROOT;
+		// A regular file where a directory is expected — every KB read fails.
+		const bogusRoot = path.join(os.tmpdir(), `omp-deck-broken-kb-${Date.now()}`);
+		fs.writeFileSync(bogusRoot, "not a directory\n");
+		process.env.OMP_DECK_KB_ROOT = bogusRoot;
+		try {
+			setAutoWorkConfig(repoCwd, { ...DEFAULT_AUTO_WORK_VALUES, enabled: true });
+			createTask({ title: "Broken KB root", cwd: repoCwd, priority: "P5", autoWork: true });
+			const createSessionCalls: CreateSessionOpts[] = [];
+			const result = await runAutoWorkCycle(
+				repoCwd,
+				fakeBridge(new FakeSessionHandle("sess_broken_kb", 10), { createSessionCalls }),
+				{ getSubscriptionUsage: async () => ({ available: true, weeklyPct: 5 }), createPullRequest: stubCreatePullRequest },
+			);
+
+			expect(result.outcome).toBe("completed");
+			expect(createSessionCalls).toHaveLength(1);
+			expect(createSessionCalls[0]?.systemPromptAppend).toBe(AUTO_WORK_RULES_BODY);
+		} finally {
+			if (savedKbRoot === undefined) delete process.env.OMP_DECK_KB_ROOT;
+			else process.env.OMP_DECK_KB_ROOT = savedKbRoot;
+			fs.rmSync(bogusRoot, { force: true });
+		}
 	});
 });
 

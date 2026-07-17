@@ -157,23 +157,43 @@ export async function fetchSubscriptionUsage(
 
 		// Build the full limits array across ALL providers (for display), sorted
 		// shortest-first. This is separate from the primary-report selection above.
-		const allById = new Map<string, { fraction: number; label: string; resetsAt?: number; windowDurationMs?: number }>();
+		//
+		// Keyed by provider:account:limitId so same-window limits from different
+		// accounts are kept as distinct display bars, not collapsed into one.
+		// Within the same (provider, account, limitId) tuple we keep the highest
+		// fraction seen (defensive — normally each tuple appears once).
+		interface DisplayEntry {
+			fraction: number;
+			label: string;
+			resetsAt?: number;
+			windowDurationMs?: number;
+			provider: string;
+			account: string;
+		}
+		const allByKey = new Map<string, DisplayEntry>();
 		for (const report of reports) {
 			for (const limit of report.limits) {
 				const fraction = resolveUsedFraction(limit);
 				if (fraction === undefined) continue;
-				const existing = allById.get(limit.id);
+				const { scope } = limit;
+				// Derive a human-readable account label, always non-empty.
+				const account =
+					scope.accountId ?? scope.orgId ?? scope.projectId ?? scope.tier ?? "(shared)";
+				const displayKey = `${scope.provider}:${account}:${limit.id}`;
+				const existing = allByKey.get(displayKey);
 				if (existing === undefined || fraction > existing.fraction) {
-					allById.set(limit.id, {
+					allByKey.set(displayKey, {
 						fraction,
 						label: limit.label,
 						resetsAt: limit.window?.resetsAt,
 						windowDurationMs: limit.window?.durationMs,
+						provider: scope.provider,
+						account,
 					});
 				}
 			}
 		}
-		const allSorted = [...allById.values()].sort((a, b) => {
+		const allSorted = [...allByKey.values()].sort((a, b) => {
 			const da = a.windowDurationMs ?? Number.POSITIVE_INFINITY;
 			const db = b.windowDurationMs ?? Number.POSITIVE_INFINITY;
 			return da - db;
@@ -186,6 +206,8 @@ export async function fetchSubscriptionUsage(
 					? new Date(entry.resetsAt).toISOString()
 					: new Date(Date.now() + (entry.windowDurationMs ?? 0)).toISOString(),
 			...(entry.windowDurationMs != null ? { windowDurationMs: entry.windowDurationMs } : {}),
+			provider: entry.provider,
+			account: entry.account,
 		}));
 
 		// session = shortest primary window, weekly = longest primary window.

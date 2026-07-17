@@ -141,6 +141,23 @@ describe("listSessionMonitor", () => {
 		})
 	})
 
+	test("does not retain a TTSR advisory as a terminal failure after a successful turn", async () => {
+		const cwd = "/workspaces/auto-work"
+		const transcriptPath = writeTranscript("ttsr-advisory.jsonl", [
+			{ type: "session", version: 3, id: "ttsr-advisory", cwd },
+			{ type: "notice", level: "error", message: "TTSR matched rules: tool policy" },
+			{ type: "ttsr_triggered", rules: [{ name: "tool policy" }] },
+			{ type: "agent_end", stopReason: "end_turn" },
+		])
+		const persisted = session("ttsr-advisory", transcriptPath, cwd)
+
+		const [entry] = await listSessionMonitor(asAgentBridge(new SessionMonitorBridge([persisted])))
+		if (!entry) throw new Error("Expected the persisted session to be monitored")
+
+		expect(entry.status).toBe("completed")
+		expect(entry.error).toBeUndefined()
+	})
+
 	test("uses a live streaming snapshot instead of a persisted transcript tail", async () => {
 		const cwd = "/workspaces/live"
 		const transcriptPath = writeTranscript("live.jsonl", [

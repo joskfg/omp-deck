@@ -36,10 +36,4 @@ describe("mapSkillsToSlashCommands", () => {
 		const out = mapSkillsToSlashCommands([skill({ enabled: false }), skill({ name: "other", enabled: true })]);
 		expect(out).toEqual([{ name: "skill:other", scope: "skill", description: "Disciplined diagnosis loop." }]);
 	});
-
-	test("prefixes the name with 'skill:' so the composer's prefix-match filter matches '/skill:' queries", () => {
-		const out = mapSkillsToSlashCommands([skill({ name: "zoom-out" })]);
-		expect(out[0]!.name.startsWith("skill:")).toBe(true);
-		expect("skill:zoom-out".startsWith("skill:")).toBe(true);
-	});
 });

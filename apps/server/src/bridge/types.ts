@@ -16,6 +16,7 @@ import type {
 	SessionHistoryResponse,
 	SessionSnapshot,
 	SessionSummary,
+	SessionTreeResponse,
 } from "@omp-deck/protocol";
 import type { GoalAction } from "./goal-mode-bridge.ts";
 
@@ -38,6 +39,20 @@ export interface AgentBridge {
 	 * the id matched neither a live handle nor the persisted listing.
 	 */
 	deleteSession(sessionId: string): Promise<{ deleted: boolean; sessionPath?: string }>;
+	/**
+	 * Read-only tree/timeline for a session's entries (T-31) — works for both
+	 * a live session and a persisted-only one. Undefined when `sessionId`
+	 * resolves to neither a live handle nor a persisted listing entry.
+	 */
+	getSessionTree(sessionId: string): Promise<SessionTreeResponse | undefined>;
+	/**
+	 * Fork a brand-new session file rooted at `entryId`'s root→leaf path in
+	 * `sessionId`'s history (T-31). Pure copy — never mutates or rewrites the
+	 * source session, live or persisted. Returns the new file's path so the
+	 * caller can `resumeSession({sessionPath})` it into a live handle.
+	 * Undefined when `sessionId` can't be resolved.
+	 */
+	forkSessionAt(sessionId: string, entryId: string): Promise<{ sessionFile: string; cwd: string } | undefined>;
 	/** Pin a session against the idle reaper while a client is subscribed. */
 	trackSubscriberAdded(sessionId: string, connectionId: string): void;
 	/** Drop a subscriber; once subscribers hit zero and idle window elapses, the reaper claims it. */
@@ -210,6 +225,8 @@ export interface SessionHandle {
 	compact(focus?: string): Promise<void>;
 	/** Swap the live agent session to a different model. Throws on unknown ref or missing auth. */
 	setModel(ref: ModelRef): Promise<void>;
+	/** Set the active thinking level. Pass `"off"` to disable explicitly; any level from `ModelInfo.thinkingLevels` to enable. */
+	setThinkingLevel(level: string): Promise<void>;
 	/**
 	 * Try to dispatch a leading slash command via the omp SDK's text-mode
 	 * dispatcher. Returns `"fallthrough"` when nothing matched — caller should
