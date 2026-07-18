@@ -30,6 +30,7 @@ interface RunRow {
 	output_tokens: number | null;
 	pct_consumed: number | null;
 	failure_reason: string | null;
+	pr_number: number | null;
 }
 
 function rowToRun(r: RunRow): AutoWorkRun {
@@ -46,8 +47,12 @@ function rowToRun(r: RunRow): AutoWorkRun {
 		outputTokens: r.output_tokens,
 		pctConsumed: r.pct_consumed,
 		failureReason: r.failure_reason,
+		prNumber: r.pr_number,
 	};
 }
+
+const RUN_COLUMNS = `id, task_id, task_priority, session_id, worktree_path, started_at, completed_at,
+		        status, input_tokens, output_tokens, pct_consumed, failure_reason, pr_number`;
 
 /** Record an open (status='running') run row. Returns the new row's id. */
 export function startAutoWorkRun(input: {
@@ -75,13 +80,15 @@ export function completeAutoWorkRun(
 		outputTokens?: number | null;
 		pctConsumed?: number | null;
 		failureReason?: string | null;
+		/** PR opened by this run. `undefined`/omitted preserves any previously-set value (COALESCE). */
+		prNumber?: number | null;
 	},
 ): void {
 	getDb()
-		.prepare<unknown, [string, string, number | null, number | null, number | null, string | null, string]>(
+		.prepare<unknown, [string, string, number | null, number | null, number | null, string | null, number | null, string]>(
 			`UPDATE auto_work_runs
 			   SET completed_at = ?, status = ?, input_tokens = ?, output_tokens = ?,
-			       pct_consumed = ?, failure_reason = ?
+			       pct_consumed = ?, failure_reason = ?, pr_number = COALESCE(?, pr_number)
 			 WHERE id = ?`,
 		)
 		.run(
@@ -91,6 +98,7 @@ export function completeAutoWorkRun(
 			patch.outputTokens ?? null,
 			patch.pctConsumed ?? null,
 			patch.failureReason ?? null,
+			patch.prNumber ?? null,
 			runId,
 		);
 }
@@ -99,8 +107,7 @@ export function completeAutoWorkRun(
 export function getAutoWorkRun(runId: string): AutoWorkRun | undefined {
 	const row = getDb()
 		.query<RunRow, [string]>(
-			`SELECT id, task_id, task_priority, session_id, worktree_path, started_at, completed_at,
-			        status, input_tokens, output_tokens, pct_consumed, failure_reason
+			`SELECT ${RUN_COLUMNS}
 			 FROM auto_work_runs WHERE id = ?`,
 		)
 		.get(runId) as RunRow | null;
@@ -142,8 +149,7 @@ export function listAutoWorkRuns(filter: {
 
 	const rows = getDb()
 		.query<RunRow, (string | number)[]>(
-			`SELECT id, task_id, task_priority, session_id, worktree_path, started_at, completed_at,
-			        status, input_tokens, output_tokens, pct_consumed, failure_reason
+			`SELECT ${RUN_COLUMNS}
 			 FROM auto_work_runs
 			 ${where}
 			 ORDER BY started_at DESC, rowid DESC

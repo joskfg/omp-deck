@@ -44,6 +44,7 @@ import {
 	failAutoWorkRun,
 	hasActiveAutoWorkRunFinalizer,
 	markRunIntentionallyStopped,
+	reconcileAutoMergedRuns,
 	reconcileInactiveAutoWorkRuns,
 	runGlobalAutoWorkCycle,
 	createPullRequestViaGh,
@@ -106,6 +107,7 @@ export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOp
 		try {
 			const saved = setAutoWorkConfig(cwd, {
 				enabled: body.enabled,
+				autoMerge: body.autoMerge,
 				modelByPriority: body.modelByPriority,
 				modelByDifficulty: body.modelByDifficulty,
 				timeWindows: body.timeWindows,
@@ -156,6 +158,7 @@ export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOp
 		}
 
 		await reconcileInactiveAutoWorkRuns(bridge);
+		await reconcileAutoMergedRuns().catch((err) => log.warn("auto-merge reconcile failed", err));
 		const response: ListAutoWorkRunsResponse = { runs: listAutoWorkRuns({ limit, taskId, priority, status }) };
 		return c.json(response);
 	});
@@ -352,6 +355,7 @@ export function buildAutoWorkRouter(bridge: AgentBridge, config: Config, cycleOp
 
 function validateWorkspaceShape(body: SetAutoWorkConfigRequest): string | undefined {
 	if (typeof body.enabled !== "boolean") return "enabled must be a boolean";
+	if (typeof body.autoMerge !== "boolean") return "autoMerge must be a boolean";
 
 	if (typeof body.modelByPriority !== "object" || body.modelByPriority === null) {
 		return "modelByPriority must be an object";

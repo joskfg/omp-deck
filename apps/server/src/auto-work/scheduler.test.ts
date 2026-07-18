@@ -16,6 +16,7 @@ mock.module("./engine.ts", () => ({
 	countEligibleWorkspaces: () => 0,
 	shouldConsiderSqueeze: () => false,
 	decideSqueezeTiming: async () => false,
+	reconcileAutoMergedRuns: async () => 0,
 }));
 
 const { disposeScheduler, updateGlobalSchedule } = await import("./scheduler.ts");

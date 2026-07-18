@@ -10,6 +10,7 @@ import type { AutoWorkConfig, SetAutoWorkConfigRequest } from "@omp-deck/protoco
 export function autoWorkConfigToRequest(config: AutoWorkConfig): SetAutoWorkConfigRequest {
 	return {
 		enabled: config.enabled,
+		autoMerge: config.autoMerge,
 		modelByPriority: config.modelByPriority,
 		modelByDifficulty: config.modelByDifficulty,
 		timeWindows: config.timeWindows,

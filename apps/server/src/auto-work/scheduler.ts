@@ -16,7 +16,7 @@ import { getAutoWorkGlobalConfig } from "../db/auto-work-global.ts";
 import { listAutoWorkConfigs } from "../db/auto-work.ts";
 import { getSubscriptionUsage } from "../usage-subscription.ts";
 import { broadcastBus } from "../broadcast-bus.ts";
-import { runGlobalAutoWorkCycle, countEligibleWorkspaces, shouldConsiderSqueeze, decideSqueezeTiming } from "./engine.ts";
+import { runGlobalAutoWorkCycle, countEligibleWorkspaces, shouldConsiderSqueeze, decideSqueezeTiming, reconcileAutoMergedRuns } from "./engine.ts";
 import type { RunAutoWorkCycleOptions } from "./engine.ts";
 import { logger } from "../log.ts";
 
@@ -147,6 +147,9 @@ export function updateGlobalSchedule(
 
 		state.cycleInFlight = true;
 		state.lastTriggeredAt = new Date().toISOString();
+		// Advance any auto-merge runs whose PR merged since the last tick
+		// (fully-autonomous mode). Best-effort — never blocks the cycle below.
+		reconcileAutoMergedRuns().catch((err: unknown) => log.warn(`auto-merge reconcile failed`, err));
 		runGlobalAutoWorkCycle(bridge, { ...cycleOptions, taskSelectionModel: config.taskSelectionModel })
 			.then(async (outcome) => {
 				state.lastOutcome = outcome;

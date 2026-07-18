@@ -155,6 +155,22 @@ describe("notify — configuration gate", () => {
 		const chatIds = fetchCalls.map((c) => (c.body as { chat_id: string }).chat_id).sort();
 		expect(chatIds).toEqual(["111", "222"]);
 	});
+
+	test("sends task_completed_pr_failed to every allowed user when configured", async () => {
+		configureTelegram();
+		stubFetchOk();
+
+		await notify({ kind: "task_completed_pr_failed", displayId: 5, reason: "boom" });
+
+		expect(fetchCalls).toHaveLength(2);
+		const texts = fetchCalls.map((c) => telegramText(c.body));
+		expect(texts).toEqual([
+			"⚠️ T-5 → validate (implementation complete, PR creation failed): boom",
+			"⚠️ T-5 → validate (implementation complete, PR creation failed): boom",
+		]);
+		const chatIds = fetchCalls.map((c) => telegramChatId(c.body)).sort();
+		expect(chatIds).toEqual(["111", "222"]);
+	});
 });
 
 describe("notify — best-effort delivery", () => {

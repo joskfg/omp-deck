@@ -33,6 +33,8 @@ const log = logger("auto-work:notify");
 export type AutoWorkNotificationEvent =
 	| { kind: "task_started"; displayId: number; title: string; model: string }
 	| { kind: "task_completed"; displayId: number; prNumber: number }
+	| { kind: "task_auto_merging"; displayId: number; prNumber: number }
+	| { kind: "task_auto_merged"; displayId: number; prNumber: number }
 	| { kind: "task_completed_pr_failed"; displayId: number; reason: string }
 	| { kind: "task_failed"; displayId: number; reason: string }
 	| { kind: "weekly_threshold"; cwd: string; pctUsed: number; thresholdPct: number }
@@ -45,6 +47,10 @@ export function formatAutoWorkNotification(event: AutoWorkNotificationEvent): st
 			return `🤖 AutoWork started T-${event.displayId}: ${event.title} [${event.model}]`;
 		case "task_completed":
 			return `✅ T-${event.displayId} → validate. PR #${event.prNumber}`;
+		case "task_auto_merging":
+			return `🔀 T-${event.displayId}: auto-merge armed (waiting for CI). PR #${event.prNumber}`;
+		case "task_auto_merged":
+			return `🎉 T-${event.displayId} merged → done. PR #${event.prNumber}`;
 		case "task_completed_pr_failed":
 			return `⚠️ T-${event.displayId} → validate (implementation complete, PR creation failed): ${event.reason}`;
 		case "task_failed":

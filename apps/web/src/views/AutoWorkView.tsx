@@ -60,6 +60,8 @@ function StatusIcon({ status }: { status: AutoWorkRunStatus }) {
 			return <Activity className="h-3.5 w-3.5 animate-pulse text-green-400" />;
 		case "completed":
 			return <CheckCircle2 className="h-3.5 w-3.5 text-green-500" />;
+		case "completed_pending_merge":
+			return <Clock className="h-3.5 w-3.5 animate-pulse text-blue-400" />;
 		case "completed_pr_failed":
 			return <AlertTriangle className="h-3.5 w-3.5 text-yellow-400" />;
 		case "failed":
@@ -73,6 +75,7 @@ function StatusBadge({ status }: { status: AutoWorkRunStatus }) {
 	const variants: Record<AutoWorkRunStatus, string> = {
 		running: "bg-green-500/15 text-green-400",
 		completed: "bg-green-500/10 text-green-500",
+		completed_pending_merge: "bg-blue-500/15 text-blue-400",
 		completed_pr_failed: "bg-yellow-500/15 text-yellow-400",
 		failed: "bg-red-500/15 text-red-400",
 		timed_out: "bg-yellow-500/15 text-yellow-400",
@@ -80,6 +83,7 @@ function StatusBadge({ status }: { status: AutoWorkRunStatus }) {
 	const labels: Record<AutoWorkRunStatus, string> = {
 		running: "Running",
 		completed: "Completed",
+		completed_pending_merge: "Merging",
 		completed_pr_failed: "PR failed",
 		failed: "Failed",
 		timed_out: "Timed out",
